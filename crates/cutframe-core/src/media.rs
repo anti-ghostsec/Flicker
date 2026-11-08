@@ -18,6 +18,8 @@ pub struct StreamInfo {
     pub height: Option<u32>,
     /// Average frames per second (video only).
     pub frame_rate: Option<f64>,
+    /// Where this stream ends (start time + length), when the container says.
+    pub end: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -34,6 +36,17 @@ impl MediaInfo {
 
     pub fn first_video(&self) -> Option<&StreamInfo> {
         self.streams.iter().find(|s| s.kind == StreamKind::Video)
+    }
+
+    /// How long there's a picture: the video track's end, when it's known and
+    /// earlier than the file's (audio often runs a little longer), else the
+    /// file's length.
+    pub fn video_length(&self) -> Option<Duration> {
+        let video = self.first_video().and_then(|v| v.end).filter(|v| !v.is_zero());
+        match (video, self.duration) {
+            (Some(v), Some(d)) => Some(v.min(d)),
+            (v, d) => v.or(d),
+        }
     }
 
     /// One-line description for the UI, e.g. "1920x1080 h264 · 2 audio · 0:42".

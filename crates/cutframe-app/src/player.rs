@@ -1,5 +1,6 @@
-//! Reusable video preview widget: play/pause, seek bar, optional subtitle
-//! overlay. Decoding runs on a background thread; the UI only uploads frames.
+//! Video player: decodes on a background thread, shows frames scaled to fit,
+//! draws an optional subtitle overlay, and can loop over a set of ranges (the
+//! live preview of a cut). Transport controls live in the app.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -7,13 +8,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cutframe_core::media::format_duration;
-use cutframe_core::{Engine, Frame, PreviewRequest};
-use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions};
+use cutframe_core::{Engine, Frame, PreviewRequest, TimeRange};
+use eframe::egui::{self, Color32, ColorImage, TextureHandle, TextureOptions};
 
 /// Frames buffered ahead of the playhead. Small, so seeking stays snappy.
 const BUFFER: usize = 4;
-const MAX_HEIGHT: f32 = 360.0;
+/// A frame this close before a range's start still counts as inside it
+/// (decoders land a hair early), so looping can't bounce forever.
+const SLACK: Duration = Duration::from_millis(80);
 
 enum Msg {
     Frame(Frame),
@@ -76,8 +78,12 @@ pub struct Player {
     clock: Option<(Instant, Duration)>,
     /// Next frame, decoded but not due yet.
     queued: Option<Frame>,
-    /// Slider value while the user is dragging.
-    scrub: Option<f64>,
+    /// When set, playback only visits these (sorted) ranges, jumping from the
+    /// end of one to the start of the next and looping back to the first.
+    play_ranges: Option<Vec<TimeRange>>,
+    /// A frame was played since the decoder last (re)started, so reaching the
+    /// end means `position` is the real last frame.
+    shown_this_run: bool,
     error: Option<String>,
 }
 
@@ -103,17 +109,47 @@ impl Player {
             needs_decoder: true,
             clock: None,
             queued: None,
-            scrub: None,
+            play_ranges: None,
+            shown_this_run: false,
             error: None,
         }
     }
 
     pub fn set_subtitle(&mut self, path: Option<PathBuf>) {
-        self.subtitle = path;
-        self.restart();
+        if self.subtitle != path {
+            self.subtitle = path;
+            self.restart();
+        }
     }
 
-    /// Stop playback (e.g. while an export is running).
+    pub fn has_subtitle(&self) -> bool {
+        self.subtitle.is_some()
+    }
+
+    pub fn show_subtitles(&self) -> bool {
+        self.show_subtitles
+    }
+
+    pub fn set_show_subtitles(&mut self, show: bool) {
+        if self.show_subtitles != show {
+            self.show_subtitles = show;
+            self.restart();
+        }
+    }
+
+    /// Restrict playback to `ranges` (looping), or `None` for the whole video.
+    pub fn set_play_ranges(&mut self, ranges: Option<Vec<TimeRange>>) {
+        let ranges = ranges.filter(|r| !r.is_empty());
+        if self.play_ranges == ranges {
+            return;
+        }
+        self.play_ranges = ranges;
+        if self.playing && self.jump_target(self.position).is_some() {
+            self.restart_at_range();
+        }
+    }
+
+    /// Stop playback (e.g. while an edit is running).
     pub fn pause(&mut self) {
         if self.playing {
             self.playing = false;
@@ -134,8 +170,57 @@ impl Player {
         self.playing
     }
 
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     pub fn seek(&mut self, to: Duration) {
         self.position = self.duration.map_or(to, |d| to.min(d));
+        self.restart();
+    }
+
+    pub fn toggle_play(&mut self) {
+        self.playing = !self.playing;
+        if self.playing {
+            let at_end = self.duration.is_some_and(|d| self.position + Duration::from_millis(100) >= d);
+            if at_end && self.play_ranges.is_none() {
+                // At the end: play again from the start.
+                self.position = Duration::ZERO;
+            }
+            if self.jump_target(self.position).is_some() {
+                self.restart_at_range();
+                return;
+            }
+        }
+        self.restart();
+    }
+
+    /// Playback just ran off the end at `position`. If the file claimed to be
+    /// longer than its last frame, shrink to fit so the timeline ends where
+    /// the picture does.
+    fn learn_end(&mut self) {
+        let frame = Duration::from_secs_f64(1.0 / self.fps);
+        let end = self.position + frame;
+        if self.duration.is_some_and(|d| d > end + frame) {
+            self.duration = Some(end);
+        }
+    }
+
+    /// Where playback should continue if `t` is outside the play ranges:
+    /// the next range's start, wrapping to the first. `None` = keep going.
+    fn jump_target(&self, t: Duration) -> Option<Duration> {
+        let ranges = self.play_ranges.as_ref()?;
+        if ranges.iter().any(|r| t + SLACK >= r.start && t < r.end) {
+            return None;
+        }
+        let next = ranges.iter().find(|r| r.start > t).unwrap_or(&ranges[0]);
+        Some(next.start)
+    }
+
+    fn restart_at_range(&mut self) {
+        if let Some(t) = self.jump_target(self.position) {
+            self.position = t;
+        }
         self.restart();
     }
 
@@ -145,6 +230,7 @@ impl Player {
         self.queued = None;
         self.clock = None;
         self.error = None;
+        self.shown_this_run = false;
         self.needs_decoder = true;
     }
 
@@ -181,7 +267,20 @@ impl Player {
                     let Some(dec) = &self.decoder else { return };
                     match dec.rx.try_recv() {
                         Ok(Msg::Frame(f)) => f,
-                        Ok(Msg::End) | Err(TryRecvError::Disconnected) => {
+                        Ok(Msg::End) => {
+                            self.decoder = None;
+                            if self.playing {
+                                if self.shown_this_run {
+                                    self.learn_end();
+                                }
+                                // Loop: back to the start (of the first play range).
+                                self.position = self.play_ranges.as_ref().map_or(Duration::ZERO, |r| r[0].start);
+                                self.restart();
+                                ctx.request_repaint();
+                            }
+                            return;
+                        }
+                        Err(TryRecvError::Disconnected) => {
                             self.decoder = None;
                             self.playing = false;
                             return;
@@ -201,11 +300,19 @@ impl Player {
                 self.show_frame(ctx, frame);
                 continue;
             }
+            if let Some(t) = self.jump_target(frame.pts) {
+                // Left the play ranges: continue at the next one.
+                self.position = t;
+                self.restart();
+                ctx.request_repaint();
+                return;
+            }
             let (start, start_pts) = *self.clock.get_or_insert((Instant::now(), frame.pts));
             let now = start_pts + start.elapsed();
             if frame.pts <= now {
                 // Due (or late): show it, then see if a newer one is also due.
                 self.show_frame(ctx, frame);
+                self.shown_this_run = true;
             } else {
                 ctx.request_repaint_after(frame.pts - now);
                 self.queued = Some(frame);
@@ -214,88 +321,35 @@ impl Player {
         }
     }
 
+    /// Decode as needed and draw the picture, scaled to fit `ui`'s whole
+    /// available area on a black background.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.pump(&ctx);
 
-        // Picture
-        let width = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, Color32::BLACK);
         match &self.texture {
             Some(tex) => {
                 let [w, h] = tex.size().map(|v| v as f32);
-                let scale = (width / w).min(MAX_HEIGHT / h);
-                let size = egui::vec2(w * scale, h * scale);
-                ui.vertical_centered(|ui| {
-                    ui.add(egui::Image::from_texture((tex.id(), size)).fit_to_exact_size(size));
-                });
+                let scale = (rect.width() / w).min(rect.height() / h);
+                let picture = egui::Rect::from_center_size(rect.center(), egui::vec2(w * scale, h * scale));
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                painter.image(tex.id(), picture, uv, Color32::WHITE);
             }
             None => {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(width, 180.0_f32.min(width * 0.56)), egui::Sense::hover());
-                ui.painter().rect_filled(rect, 4.0, Color32::from_gray(20));
-                let msg = if self.error.is_some() { "Preview unavailable" } else { "Loading…" };
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    msg,
-                    egui::FontId::proportional(14.0),
-                    Color32::GRAY,
-                );
+                let msg = match &self.error {
+                    Some(e) => last_line(e),
+                    None => "Loading…",
+                };
+                painter.text(rect.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(14.0), Color32::GRAY);
             }
         }
-
-        // Transport controls
-        ui.horizontal(|ui| {
-            let icon = if self.playing { "⏸" } else { "▶" };
-            if ui.button(RichText::new(icon).size(16.0)).on_hover_text("Play / pause (Space)").clicked()
-                || ui.input(|i| i.key_pressed(egui::Key::Space)) && !ctx.egui_wants_keyboard_input()
-            {
-                self.toggle_play();
-            }
-
-            let total = self.duration.unwrap_or_default();
-            ui.monospace(format!(
-                "{} / {}",
-                format_duration(self.scrub.map_or(self.position, Duration::from_secs_f64)),
-                format_duration(total)
-            ));
-
-            if !total.is_zero() {
-                let mut t = self.scrub.unwrap_or(self.position.as_secs_f64());
-                ui.spacing_mut().slider_width = (ui.available_width() - 130.0).max(60.0);
-                let slider = ui.add(
-                    egui::Slider::new(&mut t, 0.0..=total.as_secs_f64()).show_value(false),
-                );
-                if slider.dragged() {
-                    self.scrub = Some(t);
-                }
-                if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
-                    self.scrub = None;
-                    self.seek(Duration::from_secs_f64(t));
-                }
-            }
-
-            if self.subtitle.is_some() && ui.checkbox(&mut self.show_subtitles, "Subtitles").changed() {
-                self.restart();
-            }
-        });
-
-        if let Some(e) = &self.error {
-            ui.small(RichText::new(last_line(e)).color(Color32::LIGHT_RED)).on_hover_text(e);
-        }
-    }
-
-    fn toggle_play(&mut self) {
-        self.playing = !self.playing;
-        if self.playing && self.duration.is_some_and(|d| self.position + Duration::from_millis(100) >= d) {
-            // At the end: play again from the start.
-            self.position = Duration::ZERO;
-        }
-        self.restart();
     }
 }
 
 /// ffmpeg puts the useful part of an error at the end of its log.
-fn last_line(s: &str) -> &str {
+pub fn last_line(s: &str) -> &str {
     s.lines().rfind(|l| !l.trim().is_empty()).unwrap_or(s)
 }

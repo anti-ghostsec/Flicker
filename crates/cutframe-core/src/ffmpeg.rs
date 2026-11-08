@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::edit::{self, TrimRequest};
 use crate::engine::Engine;
 use crate::job::{CancelToken, Progress};
-use crate::media::{MediaInfo, StreamInfo, StreamKind};
+use crate::media::{parse_timestamp, MediaInfo, StreamInfo, StreamKind};
 use crate::preview::{self, Frame, FrameSource, PreviewRequest};
 use crate::subtitles::{ffmpeg_args, EmbedRequest};
 use crate::{Error, Result};
@@ -480,6 +480,8 @@ struct ProbeStream {
     height: Option<u32>,
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
+    start_time: Option<String>,
+    duration: Option<String>,
     #[serde(default)]
     tags: std::collections::HashMap<String, String>,
 }
@@ -488,6 +490,11 @@ struct ProbeStream {
 struct ProbeFormat {
     format_name: Option<String>,
     duration: Option<String>,
+}
+
+/// ffprobe's "12.500000" seconds, if valid.
+fn parse_secs(s: Option<&str>) -> Option<Duration> {
+    s?.parse::<f64>().ok().filter(|d| d.is_finite() && *d >= 0.0).map(Duration::from_secs_f64)
 }
 
 fn parse_probe(json: &[u8]) -> Result<MediaInfo> {
@@ -509,15 +516,16 @@ fn parse_probe(json: &[u8]) -> Result<MediaInfo> {
             height: s.height,
             frame_rate: parse_rate(s.avg_frame_rate.as_deref())
                 .or_else(|| parse_rate(s.r_frame_rate.as_deref())),
+            // Matroska keeps stream lengths in a tag instead.
+            end: parse_secs(s.duration.as_deref())
+                .or_else(|| s.tags.get("DURATION").and_then(|d| parse_timestamp(d)))
+                .map(|d| d + parse_secs(s.start_time.as_deref()).unwrap_or_default()),
         })
         .collect();
     let (format, duration) = match p.format {
         Some(f) => (
             f.format_name.unwrap_or_default(),
-            f.duration
-                .and_then(|d| d.parse::<f64>().ok())
-                .filter(|d| d.is_finite() && *d >= 0.0)
-                .map(Duration::from_secs_f64),
+            parse_secs(f.duration.as_deref()),
         ),
         None => (String::new(), None),
     };
@@ -549,5 +557,25 @@ mod tests {
         assert_eq!(info.streams[1].language.as_deref(), Some("eng"));
         assert!((info.streams[0].frame_rate.unwrap() - 29.97).abs() < 0.01);
         assert_eq!(parse_rate(Some("0/0")), None);
+        assert_eq!(info.video_length(), info.duration, "no stream lengths: use the file's");
+    }
+
+    #[test]
+    fn video_length_ends_with_the_picture() {
+        // A trimmed MP4: AAC padding makes the file longer than its video.
+        let json = br#"{"streams":[
+            {"index":0,"codec_type":"video","codec_name":"h264","start_time":"0.040000","duration":"2.520000"},
+            {"index":1,"codec_type":"audio","codec_name":"aac","start_time":"0.000000","duration":"2.500000"}],
+            "format":{"format_name":"mov,mp4","duration":"2.560000"}}"#;
+        let info = parse_probe(json).unwrap();
+        assert_eq!(info.video_length(), Some(Duration::from_millis(2_560)));
+
+        // Matroska: lengths are in tags; the video stops before the audio.
+        let json = br#"{"streams":[
+            {"index":0,"codec_type":"video","codec_name":"h264","tags":{"DURATION":"00:00:05.500000000"}},
+            {"index":1,"codec_type":"audio","codec_name":"opus","tags":{"DURATION":"00:00:06.000000000"}}],
+            "format":{"format_name":"matroska,webm","duration":"6.000000"}}"#;
+        let info = parse_probe(json).unwrap();
+        assert_eq!(info.video_length(), Some(Duration::from_millis(5_500)));
     }
 }

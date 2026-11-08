@@ -2,33 +2,36 @@
 
 A cross-platform video tool written in Rust. Right now it can **embed subtitles** and **trim/cut videos**. It's meant to grow into a full video editor for Windows, Linux and Android.
 
-## Features (v0.4)
+## Features (v0.5)
 
-CutFrame opens on a **Home** screen with a card for each tool. A sidebar on the left switches tools at any time. A video dropped on Home opens in every tool that can use it, and a job keeps running in the background while you use another tool.
+CutFrame is a video player with a menu bar. Playback loops, and the timeline ends where the picture does (even when a file's audio runs longer). Everything you can do lives in the menus, so the window stays a plain video screen and new features slot in as new menu entries.
 
-### Embed subtitles
+### Cutting
 
+1. **Cut > Cut Mode** (or press `C`). Two handles appear on the timeline under the video.
+2. Drag the handles: grab them anywhere along their height. The picture follows the handle you're dragging, so you see exactly where the cut lands. `I` / `O` move the start / end handle to the playhead.
+3. Press **Space** to play: playback loops over the result, between the handles in *Keep* mode, or around the removed part in *Remove* mode.
+4. **Apply** (in the menu bar, or `Enter`) cuts the video. The result becomes the current video and the timeline adapts, so you can keep cutting without re-importing. `Esc` cancels.
 
-- **Soft subtitles**: adds the subtitles as a separate track that viewers can turn on or off. Video and audio are copied as-is, so it's fast and the quality doesn't change.
-- **Hard subtitles (burn-in)**: draws the subtitles into the picture so they show on every player and website. This re-encodes the video (H.264, or VP9 for `.webm`).
-- Takes `.srt`, `.ass`/`.ssa` and `.vtt` subtitle files.
-- Picks the right subtitle codec for the output: `mov_text` for MP4/MOV, copied as-is for MKV, `webvtt` for WebM.
-- Sets the subtitle language and title, marks the track as default, and keeps any subtitle tracks the video already has.
-- **Preview player:** play, pause (Space) and scrub through the video with the subtitles drawn on top, exactly as burn-in will render them. A checkbox turns the overlay off.
+- **Cut > Keep / Remove between handles** picks what applying does.
+- **Cut > Accuracy:** *Precise* (default) re-encodes to H.264/AAC so the cut lands on the exact frame. *Fast* copies the streams losslessly but starts each part on a keyframe.
+- Subtitle tracks in the video are cut along with it. Subtitles loaded for preview are retimed too, so they stay in sync after every cut.
 
-### Trim / Cut
+### Undo and saving
 
-- Mark ranges on the preview with **Set In / Set Out** (keys `I` / `O`, or type times like `1:02.5`). Press **Add range** (`Enter`) to queue several.
-- **Keep selected parts** trims the video down to them. **Remove selected parts** cuts them out and keeps the rest. Several ranges are joined in order.
-- A timeline bar shows the selection and the playhead. Click it to jump.
-- **Fast:** stream copy. Instant and lossless, but each part has to start on a keyframe. The tab loads the keyframe positions, marks them on the timeline, and warns you when a part will start earlier than your In point.
-- **Precise:** re-encodes to H.264/AAC for frame-exact cuts.
-- **Subtitle tracks** in the video (SRT, ASS, WebVTT, MP4 `mov_text`) are cut along with it in both modes. Each line is shifted and clipped to match the kept parts, and its language and title are kept. Image-based subtitles (DVD/Blu-ray PGS) are dropped when trimming.
+- Every applied edit is a step. **Edit > Undo / Redo** (`Ctrl+Z` / `Ctrl+Y`) move between them. **File > Revert to Original** goes all the way back.
+- Edits go to temporary working files: the original is never touched. **File > Save As** (`Ctrl+S`) writes the current video. Quitting or opening another video with unsaved edits asks first.
+
+### Subtitles
+
+- **Subtitles > Load for Preview** draws a `.srt`, `.ass`/`.ssa` or `.vtt` file over the video, exactly as burn-in renders it.
+- **Add as Track** adds it as a track viewers can turn on or off (fast, no quality loss). **Burn into Picture** draws it into the video so it shows on every player (re-encodes). Both are edits you can undo. **Track Language** sets the track's language.
 
 ### General
 
-- Supports drag and drop. You can open files from the command line: `cutframe video.mp4 subs.srt`. Add `--trim` or `--subtitles` to skip Home and start in that tool.
-- Shows a live progress bar and has a Cancel button.
+- **View > Theme:** *Windows 95* (default: grey 3D bevels, navy highlights), *Light* or *Dark*. The choice is remembered.
+- Drag and drop a video to open it, or a subtitle file to preview it. From the command line: `cutframe video.mp4 subs.srt`.
+- **Help > Keyboard Shortcuts** lists every key.
 
 ## Running
 
@@ -44,7 +47,7 @@ Try it with the files in `samples/`.
 cargo test            # unit tests + end-to-end tests against real ffmpeg
 ```
 
-To check the UI without a screen grabber (for scripts and CI), set `CUTFRAME_SCREENSHOT=out.ppm`. `CUTFRAME_SCREENSHOT_AFTER=<secs>` sets how long it waits first, and `CUTFRAME_AUTOPLAY=1` starts the preview playing.
+To check the UI without a screen grabber (for scripts and CI), set `CUTFRAME_SCREENSHOT=out.ppm`. `CUTFRAME_SCREENSHOT_AFTER=<secs>` sets how long it waits first, `CUTFRAME_AUTOPLAY=1` starts playing, and `CUTFRAME_CUT=2,4` opens cut mode with the handles at 2s and 4s.
 
 ## Project layout
 
@@ -60,12 +63,12 @@ crates/
     media.rs         MediaInfo / StreamInfo from probing
     job.rs           Progress + CancelToken for long-running jobs
   cutframe-app/    egui/eframe GUI
-    app.rs           Shell: Home screen, sidebar navigation, status bar
-    player.rs        Reusable preview widget (decoder thread + frame clock)
-    tools/           One module per tool (screen)
-      common.rs        Shared pieces: file pickers, output field, JobRunner
-      subtitles.rs     Embed subtitles tab
-      trim.rs          Trim / Cut tab
+    app.rs           Window: menu bar, video, transport, status bar, dialogs
+    player.rs        Player (decoder thread + frame clock + range looping)
+    timeline.rs      The timeline and its cut handles
+    session.rs       Edit history: one working file per applied edit
+    theme.rs         Windows 95 / Light / Dark looks
+    common.rs        File pickers, JobRunner
 ```
 
 ## Design notes for the full editor
@@ -78,7 +81,7 @@ crates/
     - use `MediaCodec`/`MediaMuxer` through JNI
 - **Preview.** `FfmpegCli` streams scaled frames from ffmpeg as PPM images (each image carries its own size) at up to 30 fps. Subtitles go through the same libass filter as burn-in, so what you see is what you'll export. The preview has no audio yet: the plan is `cpal` playback with the audio as the master clock. For a real timeline, switch the decoder to `ffmpeg-next` so seeking is faster.
 - **Trimming without re-encoding.** Copy mode never seeks, because FFmpeg's quick-seek lands on different keyframes in different containers. One pass with the segment muxer splits the file at keyframes into pieces whose timestamps start at 0. The pieces are joined, each cut to length. Subtitles are never cut by FFmpeg: they're extracted from the untouched source and retimed in Rust (`retime.rs`). To debug a real file, run `cargo run -p cutframe-core --example trim -- IN OUT START END [precise]`.
-- **Tools.** Every feature is a `Tool` (see `tools.rs`). Trim, concat, crop and similar features slot in as new tabs until the timeline editor replaces them.
+- **Menus, not screens.** New features are menu entries that run an edit on the current video and push a step onto the session (`session.rs`), the same way cuts do. That keeps undo, saving and "keep working on the result" free for every feature.
 - **Android.** The GUI is egui/eframe, which runs on Android through `android-activity`. The app code lives in a library (`lib.rs`) so a `cdylib` with `android_main` can reuse it. File pickers are behind `cfg(target_os = "android")` stubs, and they still need the Storage Access Framework.
 - **Windows.** Release builds use the GUI subsystem, so no console window appears. FFmpeg child processes start with `CREATE_NO_WINDOW`. Ship `ffmpeg.exe` and `ffprobe.exe` next to `cutframe.exe`.
 
