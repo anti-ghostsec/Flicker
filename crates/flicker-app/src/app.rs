@@ -359,8 +359,16 @@ impl FlickerApp {
         let Some((job, result)) = self.job.poll() else { return };
         match (job, result) {
             (Job::Export { to }, Ok(())) => self.set_status(format!("Exported {}", to.display()), false),
-            (Job::Export { .. }, Err(e)) if e == "cancelled" => self.set_status("Export cancelled.", false),
-            (Job::Export { .. }, Err(e)) => self.fail(e),
+            (Job::Export { to }, Err(e)) => {
+                // The engine deletes a half-written file.
+                let gone = if to.exists() { String::new() } else { format!(" The unfinished {} was deleted.", file_name(&to)) };
+                if e == "cancelled" {
+                    self.set_status(format!("Export cancelled.{gone}"), false);
+                } else {
+                    self.fail(e.clone());
+                    self.set_status(format!("Export failed: {}.{gone}", last_line(&e).trim_end_matches('.')), true);
+                }
+            }
         }
     }
 
@@ -880,6 +888,11 @@ impl eframe::App for FlickerApp {
             .show(ui, |ui| self.video_area(ui));
 
         self.dialogs(&ctx);
+    }
+
+    fn on_exit(&mut self) {
+        // An export still running is stopped, and its unfinished file deleted.
+        self.job.cancel_and_wait(Duration::from_secs(5));
     }
 }
 

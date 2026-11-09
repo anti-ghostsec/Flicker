@@ -297,3 +297,111 @@ fn preview_frames_and_single_frame() {
     assert_eq!(pts[0], s(3));
     assert!(pts.windows(2).all(|w| w[0] < w[1]));
 }
+
+/// Everything in `dir`, by name.
+fn listing(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> =
+        std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    names
+}
+
+/// Every container, with the subtitles as a track or burnt in: one pass
+/// that writes just the finished file, with nothing in it that names the
+/// encoder, its version or a date. Track languages are kept.
+#[test]
+fn every_export_writes_one_private_file_and_nothing_else() {
+    let Some(dir) = workdir("onefile") else { return };
+    let (a, b, img, music) = sources(&dir);
+    let subs = dir.join("s.srt");
+    std::fs::write(&subs, "1\n00:00:00,500 --> 00:00:02,000\nHello\n").unwrap();
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    for (name, mode) in [
+        ("track.mkv", SubtitleExport::Track),
+        ("track.mov", SubtitleExport::Track),
+        ("track.mp4", SubtitleExport::Track),
+        ("burn.mp4", SubtitleExport::Burn),
+        ("burn.webm", SubtitleExport::Burn),
+    ] {
+        let mut t = timeline(&a, &b, &img, &music);
+        t.subtitle = Some(subs.clone());
+        t.subtitle_export = mode;
+        t.subtitle_language = "ger".into();
+        let out = out_dir.join(name);
+        let before = listing(&out_dir);
+        let mut req = ExportRequest::new(t, out.clone());
+        req.preset = "ultrafast".into();
+        req.canvas = Canvas { width: 160, height: 120, fps: 15.0 };
+        export(&req);
+
+        let mut expected = before.clone();
+        expected.push(name.to_owned());
+        expected.sort();
+        assert_eq!(listing(&out_dir), expected, "{name}: exactly one new file");
+
+        assert_no_tags(&out);
+        let bytes = std::fs::read(&out).unwrap();
+        for bad in [&b"x264"[..], b"Lavc", b"libx264"] {
+            assert!(!bytes.windows(bad.len()).any(|w| w == bad), "{} left in {name}", String::from_utf8_lossy(bad));
+        }
+        let info = FfmpegCli::locate().probe(&out).unwrap();
+        let sub = info.streams.iter().find(|s| s.kind == StreamKind::Subtitle);
+        match mode {
+            SubtitleExport::Track => assert_eq!(sub.expect("subtitle track").language.as_deref(), Some("ger"), "{name}"),
+            _ => assert!(sub.is_none(), "{name}"),
+        }
+    }
+}
+
+/// With "Write encoder name and dates" on, the same single pass dates the
+/// file (and still copies no tags from the sources).
+#[test]
+fn export_with_tags_dates_the_file() {
+    let Some(dir) = workdir("withtags") else { return };
+    let (a, b, img, music) = sources(&dir);
+    let out = dir.join("tagged.mkv");
+    let mut req = ExportRequest::new(timeline(&a, &b, &img, &music), out.clone());
+    req.preset = "ultrafast".into();
+    req.canvas = Canvas { width: 160, height: 120, fps: 15.0 };
+    req.keep_tags = true;
+    export(&req);
+    let t = tags(&out);
+    assert!(t.contains("lavf") && t.contains("libx264"), "{t}");
+}
+
+#[test]
+fn a_cancelled_export_leaves_nothing() {
+    let Some(dir) = workdir("cancelmid") else { return };
+    let (a, b, img, music) = sources(&dir);
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = out_dir.join("out.mp4");
+    let mut t = timeline(&a, &b, &img, &music);
+    // Long enough to still be running at the first progress report.
+    for _ in 0..6 {
+        t.append(TrackRef::V1, clip(&a)).unwrap();
+    }
+    let req = ExportRequest::new(t, out.clone());
+    let cancel = CancelToken::new();
+    let token = cancel.clone();
+    let mut reports = 0;
+    let r = FfmpegCli::locate().export_timeline(
+        &req,
+        &mut |_| {
+            reports += 1;
+            token.cancel();
+        },
+        &cancel,
+    );
+    assert!(matches!(r, Err(flicker_core::Error::Cancelled)), "{r:?}");
+    assert!(reports >= 1, "cancelled while running");
+    assert!(listing(&out_dir).is_empty(), "{:?}", listing(&out_dir));
+
+    // A file already there that ffmpeg never got to is left alone.
+    std::fs::write(&out, b"old").unwrap();
+    let mut req = req;
+    req.timeline.video[0].clips[0].path = dir.join("missing.mp4");
+    assert!(FfmpegCli::locate().export_timeline(&req, &mut |_| {}, &CancelToken::new()).is_err());
+    assert_eq!(std::fs::read(&out).unwrap(), b"old");
+}

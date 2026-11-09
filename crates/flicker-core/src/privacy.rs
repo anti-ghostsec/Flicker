@@ -1,9 +1,10 @@
 //! Saving, and what Flicker writes into a saved file besides the picture and
 //! sound.
 //!
-//! Every edit goes to a temporary working file; the only files a user keeps
-//! are written by [`crate::Engine::save`]. Saving always ends with a quick
-//! stream-copy pass ([`scrub_args`]) that writes the file privately:
+//! Timeline exports are one ffmpeg pass straight into the chosen file, with
+//! [`output_args`] making it private as it's written; nothing else is
+//! written. Single-file saves ([`crate::Engine::save`]) end with a quick
+//! stream-copy pass ([`scrub_args`]) instead. Either way the file has:
 //!
 //! * no tags copied from the source (title, comment, phone make/model, GPS
 //!   location, dates…), no chapters and no data tracks (some cameras keep
@@ -84,9 +85,13 @@ pub fn output_args(keep_tags: bool, drop_source_tags: bool, h264: bool) -> Vec<O
     if keep_tags {
         return a;
     }
-    // bitexact: the muxers leave out "encoder=Lavf…" and creation dates, the
-    // encoders leave out the version in their "encoder=Lavc…" stream tags.
-    a.extend(["-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact"].map(OsString::from));
+    // bitexact: the muxers leave out "encoder=Lavf…" and creation dates,
+    // every encoder (subtitles too) leaves its version out of what it writes.
+    a.extend(["-fflags", "+bitexact", "-flags", "+bitexact"].map(OsString::from));
+    // Even so, ffmpeg tags each encoded track "Lavc libx264" unless the
+    // track already has an encoder tag; an empty one would be dropped, so
+    // it's a single space.
+    a.extend(["-metadata:s", "encoder= "].map(OsString::from));
     if h264 {
         // NAL type 6 = SEI, where x264 puts "x264 - core NNN - options…".
         a.extend(["-bsf:v", "filter_units=remove_types=6"].map(OsString::from));

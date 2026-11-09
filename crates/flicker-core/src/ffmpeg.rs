@@ -196,20 +196,17 @@ impl Engine for FfmpegCli {
         cancel: &CancelToken,
     ) -> Result<()> {
         req.validate()?;
-        // Render next to the output, then write the file privately from
-        // there (a copy pass, like every save: encoders insist on naming
-        // themselves in stream tags).
-        let staging = privacy::staging_path(&req.output);
-        let mut render_req = req.clone();
-        render_req.output = staging.clone();
-        let args = render::export_args(&render_req);
-        let result = (|| {
-            self.run_job(&args, Some(req.timeline.duration()), &staging, on_progress, cancel)?;
-            let info = self.probe(&staging)?;
-            let args = privacy::scrub_args(&staging, &req.output, &info, req.keep_tags);
-            self.run_job(&args, None, &req.output, &mut |_| {}, cancel)
-        })();
-        let _ = std::fs::remove_file(&staging);
+        // One pass, straight into the chosen file, already private (see
+        // `privacy::output_args`): nothing else is written anywhere. The
+        // subtitle file, for a track or burning in, is read where it is.
+        let before = file_stamp(&req.output);
+        let args = render::export_args(req);
+        let result = self.run(&args, Some(req.timeline.duration()), on_progress, cancel);
+        if result.is_err() && file_stamp(&req.output) != before {
+            // Half-written: remove it. (A file of that name that ffmpeg
+            // never got to is left alone.)
+            let _ = std::fs::remove_file(&req.output);
+        }
         result
     }
 
@@ -556,6 +553,19 @@ impl FfmpegCli {
         on_progress: &mut dyn FnMut(Progress),
         cancel: &CancelToken,
     ) -> Result<()> {
+        self.run(args, total, on_progress, cancel).inspect_err(|_| {
+            let _ = std::fs::remove_file(output);
+        })
+    }
+
+    /// Run an ffmpeg job that writes `-progress pipe:1`.
+    fn run(
+        &self,
+        args: &[std::ffi::OsString],
+        total: Option<Duration>,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()> {
         let mut child = command(&self.ffmpeg)
             .args(args)
             .stdin(Stdio::null())
@@ -575,16 +585,21 @@ impl FfmpegCli {
         let log = log.join().unwrap_or_default();
 
         if cancel.is_cancelled() {
-            let _ = std::fs::remove_file(output);
             return Err(Error::Cancelled);
         }
         result?;
         if !status.success() {
-            let _ = std::fs::remove_file(output);
             return Err(Error::Ffmpeg { code: status.code(), log });
         }
         Ok(())
     }
+}
+
+/// What a file looks like on disk (None if there's none), to tell whether
+/// a job touched it.
+fn file_stamp(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()))
 }
 
 /// Frames read from an `ffmpeg ... -f image2pipe -c:v ppm pipe:1` process.

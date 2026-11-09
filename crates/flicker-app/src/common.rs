@@ -89,6 +89,20 @@ impl<T> JobRunner<T> {
         }
     }
 
+    /// Cancel the job and wait (up to `limit`) for it to clean up, e.g. to
+    /// delete a half-written export before the app quits.
+    pub fn cancel_and_wait(&mut self, limit: std::time::Duration) {
+        let Some(job) = self.job.take() else { return };
+        job.cancel.cancel();
+        let until = std::time::Instant::now() + limit;
+        while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+            match job.rx.recv_timeout(left) {
+                Ok(JobMsg::Done(_)) | Err(_) => break,
+                Ok(JobMsg::Progress(_)) => {}
+            }
+        }
+    }
+
     /// Collect messages from the worker. Call once per frame. Returns the
     /// job's tag and result when it finishes.
     pub fn poll(&mut self) -> Option<(T, Result<(), String>)> {
