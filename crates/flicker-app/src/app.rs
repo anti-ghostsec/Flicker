@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cutframe_core::media::format_timestamp;
-use cutframe_core::{
+use flicker_core::media::format_timestamp;
+use flicker_core::{
     Accuracy, EmbedMode, EmbedRequest, Engine, FfmpegCli, MediaInfo, Selection, SubtitleFormat, TimeRange,
     TrimRequest,
 };
@@ -87,7 +87,7 @@ enum Dialog {
     Error(String),
 }
 
-pub struct CutFrameApp {
+pub struct FlickerApp {
     engine: Arc<dyn Engine>,
     theme: Theme,
     video: Option<Video>,
@@ -107,7 +107,7 @@ pub struct CutFrameApp {
     dev_screenshot: Option<dev::Screenshot>,
 }
 
-impl CutFrameApp {
+impl FlickerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
         let theme = Theme::load();
         theme.apply(&cc.egui_ctx);
@@ -574,7 +574,7 @@ impl CutFrameApp {
                 if ui.button("Keyboard Shortcuts").clicked() {
                     self.dialog = Some(Dialog::Shortcuts);
                 }
-                if ui.button("About CutFrame").clicked() {
+                if ui.button("About Flicker").clicked() {
                     self.dialog = Some(Dialog::About);
                 }
             });
@@ -707,7 +707,7 @@ impl CutFrameApp {
         match dialog {
             Dialog::Unsaved(what) => {
                 let name = self.video.as_ref().map(Video::name).unwrap_or_default();
-                window(ctx, theme, "CutFrame", |ui| {
+                window(ctx, theme, "Flicker", |ui| {
                     ui.label(format!("The edits to {name} haven't been saved."));
                     ui.label("Save them as a new file first?");
                     ui.add_space(8.0);
@@ -739,7 +739,7 @@ impl CutFrameApp {
             }
             Dialog::About => {
                 let engine = self.engine.name();
-                window(ctx, theme, "About CutFrame", |ui| {
+                window(ctx, theme, "About Flicker", |ui| {
                     ui.label(RichText::new(crate::APP_NAME).strong().size(18.0));
                     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     ui.label(format!("Engine: {}", engine.lines().next().unwrap_or_default()));
@@ -796,7 +796,7 @@ impl CutFrameApp {
     }
 }
 
-impl eframe::App for CutFrameApp {
+impl eframe::App for FlickerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if let Some(shot) = &mut self.dev_screenshot {
@@ -911,8 +911,8 @@ fn retime_subtitle(session: &mut Session, keep: &[TimeRange]) -> Option<PathBuf>
     let src = session.subtitle()?.to_path_buf();
     let text = std::fs::read_to_string(&src).ok()?;
     let (out_text, ext) = match SubtitleFormat::from_path(&src)? {
-        SubtitleFormat::Ass => (cutframe_core::retime::retime_ass(&text, keep), "ass"),
-        SubtitleFormat::Srt => (cutframe_core::retime::retime_srt(&text, keep), "srt"),
+        SubtitleFormat::Ass => (flicker_core::retime::retime_ass(&text, keep), "ass"),
+        SubtitleFormat::Srt => (flicker_core::retime::retime_srt(&text, keep), "srt"),
         SubtitleFormat::WebVtt => return None,
     };
     let path = session.next_path(ext).ok()?;
@@ -921,9 +921,9 @@ fn retime_subtitle(session: &mut Session, keep: &[TimeRange]) -> Option<PathBuf>
 }
 
 /// Developer aids for checking the UI without a screen grabber:
-/// `CUTFRAME_SCREENSHOT=out.ppm CUTFRAME_SCREENSHOT_AFTER=2.5 cutframe …`
-/// saves the window after the given number of seconds. Add `CUTFRAME_AUTOPLAY=1`
-/// to start playing, and `CUTFRAME_CUT=2,4` to open cut mode with the handles
+/// `FLICKER_SCREENSHOT=out.ppm FLICKER_SCREENSHOT_AFTER=2.5 flicker …`
+/// saves the window after the given number of seconds. Add `FLICKER_AUTOPLAY=1`
+/// to start playing, and `FLICKER_CUT=2,4` to open cut mode with the handles
 /// at 2s and 4s.
 mod dev {
     use std::time::{Duration, Instant};
@@ -931,7 +931,7 @@ mod dev {
     use eframe::egui;
 
     pub fn cut_from_env() -> Option<(Duration, Duration)> {
-        let s = std::env::var("CUTFRAME_CUT").ok()?;
+        let s = std::env::var("FLICKER_CUT").ok()?;
         let (a, b) = s.split_once(',')?;
         Some((Duration::from_secs_f64(a.trim().parse().ok()?), Duration::from_secs_f64(b.trim().parse().ok()?)))
     }
@@ -944,8 +944,8 @@ mod dev {
 
     impl Screenshot {
         pub fn from_env() -> Option<Self> {
-            let path = std::env::var("CUTFRAME_SCREENSHOT").ok()?;
-            let after = std::env::var("CUTFRAME_SCREENSHOT_AFTER")
+            let path = std::env::var("FLICKER_SCREENSHOT").ok()?;
+            let after = std::env::var("FLICKER_SCREENSHOT_AFTER")
                 .ok()
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(2.0);

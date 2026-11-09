@@ -1,6 +1,6 @@
 [package]
-name = "cutframe-core"
-description = "UI-agnostic media processing core for CutFrame"
+name = "flicker-core"
+description = "UI-agnostic media processing core for Flicker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

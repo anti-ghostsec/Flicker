@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cutframe_core::{Engine, Frame, PreviewRequest, TimeRange};
+use flicker_core::{Engine, Frame, PreviewRequest, TimeRange};
 use eframe::egui::{self, Color32, ColorImage, TextureHandle, TextureOptions};
 
 /// Frames buffered ahead of the playhead. Small, so seeking stays snappy.
@@ -104,7 +104,7 @@ impl Player {
             texture: None,
             position: Duration::ZERO,
             // Developer aid (see app.rs `dev`): start playing immediately.
-            playing: std::env::var_os("CUTFRAME_AUTOPLAY").is_some(),
+            playing: std::env::var_os("FLICKER_AUTOPLAY").is_some(),
             decoder: None,
             needs_decoder: true,
             clock: None,

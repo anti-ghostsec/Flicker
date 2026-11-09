@@ -1,5 +1,5 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 fn main() -> eframe::Result {
-    cutframe_app::run_desktop()
+    flicker_app::run_desktop()
 }

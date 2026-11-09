@@ -1,16 +1,16 @@
 [package]
-name = "cutframe-app"
-description = "CutFrame desktop/mobile GUI"
+name = "flicker-app"
+description = "Flicker desktop/mobile GUI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "cutframe"
+name = "flicker"
 path = "src/main.rs"
 
 [dependencies]
-cutframe-core = { path = "../cutframe-core" }
+flicker-core = { path = "../flicker-core" }
 eframe = "0.37"
 
 # Native file dialogs exist on desktop only; Android will use the system picker.

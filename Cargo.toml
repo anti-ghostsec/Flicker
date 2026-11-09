@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cutframe-core", "crates/cutframe-app"]
+members = ["crates/flicker-core", "crates/flicker-app"]
 
 [workspace.package]
 version = "0.1.0"

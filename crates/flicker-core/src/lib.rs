@@ -1,4 +1,4 @@
-//! CutFrame core: media processing that knows nothing about the UI.
+//! Flicker core: media processing that knows nothing about the UI.
 //!
 //! Everything here talks to an [`Engine`]. Today the only engine shells out to
 //! the `ffmpeg`/`ffprobe` executables; later an in-process engine (e.g. linked

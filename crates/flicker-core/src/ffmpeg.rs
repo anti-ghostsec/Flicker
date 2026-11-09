@@ -383,7 +383,7 @@ impl TempDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
-        let dir = std::env::temp_dir().join(format!("cutframe-{}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("flicker-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
         Ok(Self(dir))
     }

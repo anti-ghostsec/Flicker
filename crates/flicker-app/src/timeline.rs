@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use cutframe_core::{Selection, TimeRange};
+use flicker_core::{Selection, TimeRange};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke};
 
 use crate::theme::{self, Theme};
@@ -48,7 +48,7 @@ impl Cut {
 
     /// What the video becomes when the cut is applied.
     pub fn keep(&self, total: Duration) -> Vec<TimeRange> {
-        cutframe_core::edit::keep_ranges(&[self.range()], self.selection, total)
+        flicker_core::edit::keep_ranges(&[self.range()], self.selection, total)
     }
 
     pub fn dragging(&self) -> Option<Handle> {

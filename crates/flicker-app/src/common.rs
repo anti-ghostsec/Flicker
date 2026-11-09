@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-use cutframe_core::{CancelToken, Progress};
+use flicker_core::{CancelToken, Progress};
 use eframe::egui;
 
 pub const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "m4v", "webm", "avi", "ts", "flv", "wmv"];
@@ -57,7 +57,7 @@ impl<T> JobRunner<T> {
     /// cancel token. `label` is shown while it runs.
     pub fn start<F>(&mut self, ctx: &egui::Context, label: impl Into<String>, tag: T, work: F)
     where
-        F: FnOnce(&mut dyn FnMut(Progress), &CancelToken) -> cutframe_core::Result<()>
+        F: FnOnce(&mut dyn FnMut(Progress), &CancelToken) -> flicker_core::Result<()>
             + Send
             + 'static,
     {

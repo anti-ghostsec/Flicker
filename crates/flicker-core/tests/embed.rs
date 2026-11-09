@@ -5,7 +5,7 @@ use std::process::Command;
 
 use std::time::Duration;
 
-use cutframe_core::{
+use flicker_core::{
     Accuracy, CancelToken, EmbedMode, EmbedRequest, Engine, FfmpegCli, MediaInfo, Selection,
     StreamKind, TimeRange, TrimRequest,
 };
@@ -17,7 +17,7 @@ fn workdir(name: &str) -> Option<PathBuf> {
         eprintln!("ffmpeg not found, skipping");
         return None;
     }
-    let dir = std::env::temp_dir().join(format!("cutframe-test-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("flicker-test-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     Some(dir)
@@ -108,10 +108,10 @@ fn rejects_output_equal_to_input() {
     let err = FfmpegCli::locate()
         .embed_subtitles(&req, &mut |_| {}, &CancelToken::new())
         .unwrap_err();
-    assert!(matches!(err, cutframe_core::Error::OutputIsInput));
+    assert!(matches!(err, flicker_core::Error::OutputIsInput));
 }
 
-fn decode_all(req: &cutframe_core::PreviewRequest) -> Vec<cutframe_core::Frame> {
+fn decode_all(req: &flicker_core::PreviewRequest) -> Vec<flicker_core::Frame> {
     let mut src = FfmpegCli::locate().open_preview(req).unwrap();
     let mut frames = Vec::new();
     while let Some(f) = src.next_frame().unwrap() {
@@ -126,7 +126,7 @@ fn preview_streams_scaled_frames() {
     let video = dir.join("in.mp4");
     make_video(&video);
 
-    let mut req = cutframe_core::PreviewRequest::new(video);
+    let mut req = flicker_core::PreviewRequest::new(video);
     req.max_width = 160;
     req.fps = 10.0;
     let frames = decode_all(&req);
@@ -145,7 +145,7 @@ fn preview_after_seek_draws_subtitles() {
     std::fs::write(&subs, SRT).unwrap();
 
     // 2.0s is inside the second cue (1.6–2.8s); seeking must keep timing right.
-    let mut req = cutframe_core::PreviewRequest::new(video);
+    let mut req = flicker_core::PreviewRequest::new(video);
     req.start = std::time::Duration::from_secs(2);
     req.single_frame = true;
     let plain = decode_all(&req);
@@ -172,7 +172,7 @@ fn trim(name: &str, sel: &[(f64, f64)], selection: Selection, accuracy: Accuracy
         .iter()
         .map(|&(a, b)| TimeRange::new(Duration::from_secs_f64(a), Duration::from_secs_f64(b)))
         .collect();
-    let keep = cutframe_core::edit::keep_ranges(&ranges, selection, Duration::from_secs(6));
+    let keep = flicker_core::edit::keep_ranges(&ranges, selection, Duration::from_secs(6));
     let mut req = TrimRequest::new(video, dir.join("out.mp4"), keep);
     req.accuracy = accuracy;
     req.preset = "ultrafast".into();

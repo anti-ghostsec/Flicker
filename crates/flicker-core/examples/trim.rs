@@ -1,9 +1,9 @@
 //! Run the trim engine from the command line (handy for debugging real files):
-//! `cargo run -p cutframe-core --example trim -- IN OUT START END [precise]`
+//! `cargo run -p flicker-core --example trim -- IN OUT START END [precise]`
 //! START/END accept the same formats as the app (e.g. 90, 1:30, 1:30.5).
 
-use cutframe_core::media::parse_timestamp;
-use cutframe_core::{Accuracy, CancelToken, Engine, FfmpegCli, TimeRange, TrimRequest};
+use flicker_core::media::parse_timestamp;
+use flicker_core::{Accuracy, CancelToken, Engine, FfmpegCli, TimeRange, TrimRequest};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
