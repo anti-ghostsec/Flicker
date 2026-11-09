@@ -155,6 +155,7 @@ pub(crate) fn base_args() -> Vec<OsString> {
 }
 
 fn finish_args(a: &mut Vec<OsString>, output: &Path) {
+    a.extend(crate::privacy::encoder_flags());
     let ext = output.extension().and_then(|e| e.to_str()).unwrap_or("");
     if matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "m4v" | "mov") {
         a.extend(strs(&["-movflags", "+faststart"]));

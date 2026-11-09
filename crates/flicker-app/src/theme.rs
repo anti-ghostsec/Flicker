@@ -1,5 +1,6 @@
 //! Look and feel. "Windows 95" matches the classic desktop: grey 3D bevels,
-//! navy highlights, square corners. The choice is remembered between runs.
+//! navy highlights, square corners. The choice is remembered between runs
+//! (see `settings.rs`).
 
 use eframe::egui::{self, Color32, CornerRadius, Painter, Rect, Shadow, Stroke};
 
@@ -27,7 +28,7 @@ impl Theme {
         }
     }
 
-    fn key(self) -> &'static str {
+    pub fn key(self) -> &'static str {
         match self {
             Theme::Win95 => "win95",
             Theme::Light => "light",
@@ -56,21 +57,14 @@ impl Theme {
         });
     }
 
-    /// Saved choice, defaulting to Windows 95.
-    pub fn load() -> Self {
-        let saved = config_file().and_then(|f| std::fs::read_to_string(f).ok());
-        Self::ALL
-            .into_iter()
-            .find(|t| saved.as_deref().map(str::trim) == Some(t.key()))
-            .unwrap_or(Theme::Win95)
-    }
-
-    pub fn save(self) {
-        if let Some(f) = config_file() {
-            if let Some(dir) = f.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(f, self.key());
+    /// A saved or `FLICKER_THEME` name. "classic" is the Windows 95 look
+    /// (what FerroOS's menu entry asks for).
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "classic" | "win95" | "windows95" => Some(Theme::Win95),
+            "light" => Some(Theme::Light),
+            "dark" => Some(Theme::Dark),
+            _ => None,
         }
     }
 
@@ -139,12 +133,4 @@ fn win95_visuals() -> egui::Visuals {
         wv.fg_stroke = Stroke::new(1.0, LIGHT);
     }
     v
-}
-
-fn config_file() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(std::path::PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
-    Some(base.join("flicker").join("theme"))
 }

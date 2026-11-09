@@ -4,12 +4,13 @@ use std::time::{Duration, Instant};
 
 use flicker_core::media::format_timestamp;
 use flicker_core::{
-    Accuracy, EmbedMode, EmbedRequest, Engine, FfmpegCli, MediaInfo, Selection, SubtitleFormat, TimeRange,
-    TrimRequest,
+    Accuracy, AudioEdit, AudioRequest, Clip, EmbedMode, EmbedRequest, Engine, ExportRequest, FfmpegCli, MediaInfo,
+    SaveRequest, Selection, StreamKind, SubtitleFormat, TimeRange, Timeline, Transition, TransitionKind, TrimRequest,
 };
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 
-use crate::common::{dropped_files, has_ext, pick_file, save_file, JobRunner, VIDEO_EXTS};
+use crate::common::{dropped_files, has_ext, pick_file, pick_media, save_file, JobRunner, IMAGE_EXTS, VIDEO_EXTS};
+use crate::settings::Settings;
 use crate::player::{last_line, Player};
 use crate::session::{Session, Step};
 use crate::theme::{self, Theme};
@@ -62,6 +63,42 @@ impl Video {
     fn name(&self) -> String {
         file_name(self.session.original())
     }
+
+    fn has_audio(&self) -> bool {
+        self.info.count(StreamKind::Audio) > 0
+    }
+
+    /// The current video as the first clip of an Append.
+    fn as_clip(&self) -> Clip {
+        clip_from(self.session.current().to_path_buf(), &self.info, self.total())
+    }
+}
+
+/// A clip for a probed video, playing it whole.
+fn clip_from(path: PathBuf, info: &MediaInfo, len: Duration) -> Clip {
+    let mut c = Clip::video(path, len, info.count(StreamKind::Audio) > 0);
+    if let Some(v) = info.first_video() {
+        (c.width, c.height, c.fps) = (v.width, v.height, v.frame_rate);
+    }
+    c
+}
+
+/// How an appended clip starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Join {
+    Cut,
+    Crossfade,
+    DipToBlack,
+}
+
+/// Edit > Append's dialog.
+struct AppendForm {
+    /// The file to append, probed.
+    clip: Clip,
+    is_picture: bool,
+    picture_secs: f32,
+    join: Join,
+    join_secs: f32,
 }
 
 /// What a background job is for, so its result can be put to use.
@@ -85,11 +122,24 @@ enum Dialog {
     Shortcuts,
     About,
     Error(String),
+    Append(AppendForm),
+    /// Audio > Volume, in percent.
+    Volume(f32),
+    /// Audio > Fade In/Out, in seconds.
+    Fade { fade_in: f32, fade_out: f32 },
+}
+
+/// What a dialog's OK asks for.
+enum DialogAction {
+    Append(Clip),
+    Audio(AudioEdit),
 }
 
 pub struct FlickerApp {
     engine: Arc<dyn Engine>,
     theme: Theme,
+    /// "Write encoder name and dates into saved files".
+    write_tags: bool,
     video: Option<Video>,
     cut: Option<Cut>,
     accuracy: Accuracy,
@@ -109,11 +159,13 @@ pub struct FlickerApp {
 
 impl FlickerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
-        let theme = Theme::load();
+        let settings = Settings::load();
+        let theme = settings.theme;
         theme.apply(&cc.egui_ctx);
         let mut app = Self {
             engine: Arc::new(FfmpegCli::locate()),
             theme,
+            write_tags: settings.write_tags,
             video: None,
             cut: None,
             accuracy: Accuracy::Precise,
@@ -134,6 +186,12 @@ impl FlickerApp {
             let mut c = Cut::new(v.total(), Duration::ZERO);
             (c.start, c.end) = cut;
             app.cut = Some(c);
+        }
+        match dev::dialog_from_env() {
+            Some(dev::Dialog::Volume) => app.dialog = Some(Dialog::Volume(100.0)),
+            Some(dev::Dialog::Fade) => app.dialog = Some(Dialog::Fade { fade_in: 1.0, fade_out: 1.0 }),
+            Some(dev::Dialog::Append(path)) => app.ask_append(path),
+            None => {}
         }
         app
     }
@@ -310,21 +368,87 @@ impl FlickerApp {
             self.set_status("Already saved there.", false);
             return;
         }
-        let same_container = from.extension().map(|e| e.to_ascii_lowercase()) == to.extension().map(|e| e.to_ascii_lowercase());
-        let total = v.total();
+        let mut req = SaveRequest::new(from, to.clone());
+        req.keep_tags = self.write_tags;
+        let label = if req.is_webm() { "Saving as WebM (re-encoding)" } else { "Saving" };
         v.player.pause();
         let engine = self.engine.clone();
-        let dest = to.clone();
-        self.job.start(ctx, "Saving", Job::Save { to, then }, move |p, c| {
-            if same_container {
-                std::fs::copy(&from, &dest)?;
-                Ok(())
-            } else {
-                // Different container: remux without re-encoding.
-                let req = TrimRequest::new(from, dest, vec![TimeRange::new(Duration::ZERO, total)]);
-                engine.trim(&req, p, c)
+        self.job.start(ctx, label, Job::Save { to, then }, move |p, c| engine.save(&req, p, c));
+    }
+
+    // ---- Appending and sound ---------------------------------------------
+
+    fn menu_append(&mut self) {
+        if let Some(p) = pick_media() {
+            self.ask_append(p);
+        }
+    }
+
+    /// Probe the file to append and ask how to join it.
+    fn ask_append(&mut self, path: PathBuf) {
+        if self.video.is_none() {
+            return;
+        }
+        let is_picture = has_ext(&path, IMAGE_EXTS);
+        let clip = if is_picture {
+            Clip::image(path)
+        } else {
+            match self.engine.probe(&path) {
+                Ok(info) if info.first_video().is_some() => {
+                    let len = info.video_length().unwrap_or_default();
+                    clip_from(path, &info, len)
+                }
+                Ok(_) => return self.set_status(format!("{} has no video track.", file_name(&path)), true),
+                Err(e) => return self.set_status(format!("Can't open {}: {e}", file_name(&path)), true),
             }
-        });
+        };
+        self.dialog = Some(Dialog::Append(AppendForm { clip, is_picture, picture_secs: 4.0, join: Join::Cut, join_secs: 1.0 }));
+    }
+
+    /// Render the current video followed by `clip` into a new step.
+    fn append(&mut self, ctx: &egui::Context, clip: Clip) {
+        let Some(v) = &mut self.video else { return };
+        if self.job.is_busy() {
+            return;
+        }
+        let output = match v.session.next_path(&v.session.working_ext()) {
+            Ok(p) => p,
+            Err(e) => return self.set_status(format!("Can't create a working file: {e}"), true),
+        };
+        let timeline = Timeline { clips: vec![v.as_clip(), clip] };
+        // Land a little before the join so it can be checked straight away.
+        let seek_to = timeline.starts()[1].saturating_sub(Duration::from_secs(1));
+        let mut req = ExportRequest::new(timeline, output.clone());
+        req.crf = 18;
+        req.preset = "fast".into();
+        v.player.pause();
+        let subtitle = v.session.subtitle().map(Path::to_path_buf);
+        let engine = self.engine.clone();
+        let job = Job::Edit { label: "Append".into(), output, subtitle, seek_to };
+        self.job.start(ctx, "Appending", job, move |p, c| engine.export_timeline(&req, p, c));
+    }
+
+    fn edit_audio(&mut self, ctx: &egui::Context, edit: AudioEdit) {
+        let Some(v) = &mut self.video else { return };
+        if self.job.is_busy() {
+            return;
+        }
+        let output = match v.session.next_path(&v.session.working_ext()) {
+            Ok(p) => p,
+            Err(e) => return self.set_status(format!("Can't create a working file: {e}"), true),
+        };
+        let label = match edit {
+            AudioEdit::Volume(f) => format!("Volume {:.0}%", f * 100.0),
+            AudioEdit::Mute => "Mute".into(),
+            AudioEdit::Fade { .. } => "Fade".into(),
+        };
+        let req = AudioRequest::new(v.session.current().to_path_buf(), output.clone(), edit);
+        let seek_to = v.player.position();
+        v.player.pause();
+        let subtitle = v.session.subtitle().map(Path::to_path_buf);
+        let engine = self.engine.clone();
+        let job = Job::Edit { label: label.clone(), output, subtitle, seek_to };
+        self.job.start(ctx, label, job, move |p, c| engine.edit_audio(&req, p, c));
     }
 
     fn undo(&mut self) {
@@ -467,6 +591,14 @@ impl FlickerApp {
                     self.revert();
                 }
                 ui.separator();
+                ui.menu_button("Preferences", |ui| {
+                    let mut tags = self.write_tags;
+                    if check_item(ui, &mut tags, "Write encoder name and dates into saved files") {
+                        self.write_tags = tags;
+                        Settings::update(|s| s.write_tags = tags);
+                    }
+                });
+                ui.separator();
                 if item(ui, true, "Exit", "Ctrl+Q") {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -486,6 +618,10 @@ impl FlickerApp {
                 }
                 if item(ui, redo.is_some() && !busy, &text("Redo", &redo), "Ctrl+Y") {
                     self.redo();
+                }
+                ui.separator();
+                if item(ui, has_video && !busy, "Append Video or Picture…", "") {
+                    self.menu_append();
                 }
             });
 
@@ -526,6 +662,19 @@ impl FlickerApp {
                 });
             });
 
+            ui.menu_button("Audio", |ui| {
+                let sound = self.video.as_ref().is_some_and(Video::has_audio) && !busy;
+                if item(ui, sound, "Volume…", "") {
+                    self.dialog = Some(Dialog::Volume(100.0));
+                }
+                if item(ui, sound, "Mute", "") {
+                    self.edit_audio(&ctx, AudioEdit::Mute);
+                }
+                if item(ui, sound, "Fade In/Out…", "") {
+                    self.dialog = Some(Dialog::Fade { fade_in: 1.0, fade_out: 1.0 });
+                }
+            });
+
             ui.menu_button("Subtitles", |ui| {
                 if item(ui, has_video, "Load for Preview…", "") {
                     if let Some(p) = pick_file("Subtitles", SubtitleFormat::EXTENSIONS) {
@@ -535,7 +684,7 @@ impl FlickerApp {
                 if let Some(v) = &mut self.video {
                     if v.player.has_subtitle() {
                         let mut show = v.player.show_subtitles();
-                        if ui.checkbox(&mut show, "Show on Video").changed() {
+                        if check_item(ui, &mut show, "Show on Video") {
                             v.player.set_show_subtitles(show);
                         }
                         if ui.button("Unload").clicked() {
@@ -564,7 +713,7 @@ impl FlickerApp {
                         if ui.radio(self.theme == t, t.name()).clicked() {
                             self.theme = t;
                             t.apply(&ctx);
-                            t.save();
+                            Settings::update(|s| s.theme = t);
                         }
                     }
                 });
@@ -700,11 +849,13 @@ impl FlickerApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = &self.dialog else { return };
+        let Some(mut dialog) = self.dialog.take() else { return };
         let theme = self.theme;
         let mut close = false;
         let mut then: Option<Result<Pending, Pending>> = None; // Ok = discard & go, Err = save first
-        match dialog {
+        let mut action: Option<DialogAction> = None;
+        let total = self.video.as_ref().map(Video::total).unwrap_or_default();
+        match &mut dialog {
             Dialog::Unsaved(what) => {
                 let name = self.video.as_ref().map(Video::name).unwrap_or_default();
                 window(ctx, theme, "Flicker", |ui| {
@@ -758,13 +909,105 @@ impl FlickerApp {
                     close = ui.button("OK").clicked();
                 });
             }
+            Dialog::Append(form) => {
+                window(ctx, theme, "Append Video or Picture", |ui| {
+                    let what = if form.is_picture { "picture" } else { "video" };
+                    ui.label(format!("Add the {what} {} to the end.", form.clip.name()));
+                    ui.add_space(6.0);
+                    egui::Grid::new("append").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        if form.is_picture {
+                            ui.label("Show the picture for:");
+                            seconds(ui, &mut form.picture_secs, 0.5..=600.0);
+                            ui.end_row();
+                        }
+                        ui.label("Join with:");
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut form.join, Join::Cut, "Cut");
+                            ui.radio_value(&mut form.join, Join::Crossfade, "Cross-fade");
+                            ui.radio_value(&mut form.join, Join::DipToBlack, "Dip to black");
+                        });
+                        ui.end_row();
+                        ui.label("Transition length:");
+                        ui.add_enabled_ui(form.join != Join::Cut, |ui| seconds(ui, &mut form.join_secs, 0.1..=10.0));
+                        ui.end_row();
+                    });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("A different size is fitted with black bars.").small().weak());
+                    ui.add_space(8.0);
+                    match ok_cancel(ui) {
+                        Some(true) => {
+                            let mut clip = form.clip.clone();
+                            if form.is_picture {
+                                clip.set_range(Duration::ZERO, Duration::from_secs_f32(form.picture_secs));
+                            }
+                            let kind = match form.join {
+                                Join::Cut => None,
+                                Join::Crossfade => Some(TransitionKind::Crossfade),
+                                Join::DipToBlack => Some(TransitionKind::DipToBlack),
+                            };
+                            if let Some(kind) = kind {
+                                clip.transition = Transition { kind, duration: Duration::from_secs_f32(form.join_secs) };
+                            }
+                            action = Some(DialogAction::Append(clip));
+                        }
+                        Some(false) => close = true,
+                        None => {}
+                    }
+                });
+            }
+            Dialog::Volume(percent) => {
+                window(ctx, theme, "Volume", |ui| {
+                    ui.label("Change the volume of the whole video.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().slider_width = 220.0;
+                        ui.add(egui::Slider::new(percent, 0.0..=200.0).step_by(5.0).fixed_decimals(0).suffix("%"));
+                    });
+                    ui.add_space(8.0);
+                    match ok_cancel(ui) {
+                        Some(true) => action = Some(DialogAction::Audio(AudioEdit::Volume(*percent / 100.0))),
+                        Some(false) => close = true,
+                        None => {}
+                    }
+                });
+            }
+            Dialog::Fade { fade_in, fade_out } => {
+                let max = (total.as_secs_f32() / 2.0).max(0.1);
+                window(ctx, theme, "Fade In/Out", |ui| {
+                    ui.label("Fade the sound in at the start and out at the end.");
+                    ui.add_space(6.0);
+                    egui::Grid::new("fade").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label("Fade in:");
+                        seconds(ui, fade_in, 0.0..=max);
+                        ui.end_row();
+                        ui.label("Fade out:");
+                        seconds(ui, fade_out, 0.0..=max);
+                        ui.end_row();
+                    });
+                    ui.add_space(8.0);
+                    match ok_cancel(ui) {
+                        Some(true) => {
+                            action = Some(DialogAction::Audio(AudioEdit::Fade {
+                                fade_in: Duration::from_secs_f32(*fade_in),
+                                fade_out: Duration::from_secs_f32(*fade_out),
+                            }))
+                        }
+                        Some(false) => close = true,
+                        None => {}
+                    }
+                });
+            }
         }
-        if close {
-            self.dialog = None;
+        if !close && then.is_none() && action.is_none() {
+            self.dialog = Some(dialog);
+        }
+        match action {
+            Some(DialogAction::Append(clip)) => self.append(ctx, clip),
+            Some(DialogAction::Audio(edit)) => self.edit_audio(ctx, edit),
+            None => {}
         }
         match then {
             Some(Ok(what)) => {
-                self.dialog = None;
                 if let Some(v) = &mut self.video {
                     v.session.mark_saved(); // discarding: nothing left to ask about
                 }
@@ -774,7 +1017,6 @@ impl FlickerApp {
                 }
             }
             Some(Err(what)) => {
-                self.dialog = None;
                 self.save_as(ctx, Some(what));
             }
             None => {}
@@ -854,6 +1096,51 @@ fn item(ui: &mut egui::Ui, enabled: bool, text: &str, shortcut: &str) -> bool {
     ui.add_enabled(enabled, b).clicked()
 }
 
+/// A menu entry with a check mark in front when on, like Windows menus
+/// (checkboxes don't show inside menus). Returns true when toggled.
+fn check_item(ui: &mut egui::Ui, on: &mut bool, text: &str) -> bool {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::default();
+    // The mark is always laid out, just invisible when off, so the text
+    // doesn't move. PLACEHOLDER takes the button's own (hover) colour.
+    let mark = if *on { Color32::PLACEHOLDER } else { Color32::TRANSPARENT };
+    job.append("✔  ", 0.0, egui::TextFormat::simple(font.clone(), mark));
+    job.append(text, 0.0, egui::TextFormat::simple(font, Color32::PLACEHOLDER));
+    let clicked = ui.add(egui::Button::new(job)).clicked();
+    if clicked {
+        *on = !*on;
+    }
+    clicked
+}
+
+/// A seconds field for dialogs.
+fn seconds(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
+    ui.add(egui::DragValue::new(value).range(range).speed(0.1).max_decimals(1).suffix(" s"));
+}
+
+/// OK / Cancel at the bottom of a dialog. `Some(true)` for OK (or Enter),
+/// `Some(false)` for Cancel (or Esc).
+fn ok_cancel(ui: &mut egui::Ui) -> Option<bool> {
+    let mut answer = None;
+    ui.horizontal(|ui| {
+        if ui.add(egui::Button::new("OK").min_size(egui::vec2(72.0, 0.0))).clicked() {
+            answer = Some(true);
+        }
+        if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 0.0))).clicked() {
+            answer = Some(false);
+        }
+    });
+    // Fields above have already taken a value typed before Enter.
+    if answer.is_none() {
+        if ui.input(|i| i.key_pressed(Key::Enter)) {
+            answer = Some(true);
+        } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+            answer = Some(false);
+        }
+    }
+    answer
+}
+
 /// A sunken status-bar field.
 fn sunken_label(ui: &mut egui::Ui, theme: Theme, text: RichText, width: f32) {
     let width = width.max(80.0);
@@ -924,11 +1211,28 @@ fn retime_subtitle(session: &mut Session, keep: &[TimeRange]) -> Option<PathBuf>
 /// `FLICKER_SCREENSHOT=out.ppm FLICKER_SCREENSHOT_AFTER=2.5 flicker …`
 /// saves the window after the given number of seconds. Add `FLICKER_AUTOPLAY=1`
 /// to start playing, and `FLICKER_CUT=2,4` to open cut mode with the handles
-/// at 2s and 4s.
+/// at 2s and 4s. `FLICKER_DIALOG=volume|fade|append=<file>` opens a dialog.
 mod dev {
     use std::time::{Duration, Instant};
 
     use eframe::egui;
+
+    pub enum Dialog {
+        Volume,
+        Fade,
+        Append(std::path::PathBuf),
+    }
+
+    /// `FLICKER_DIALOG=volume`, `fade` or `append=<file>` opens that dialog.
+    pub fn dialog_from_env() -> Option<Dialog> {
+        let s = std::env::var("FLICKER_DIALOG").ok()?;
+        match s.split_once('=') {
+            Some(("append", path)) => Some(Dialog::Append(path.into())),
+            _ if s == "volume" => Some(Dialog::Volume),
+            _ if s == "fade" => Some(Dialog::Fade),
+            _ => None,
+        }
+    }
 
     pub fn cut_from_env() -> Option<(Duration, Duration)> {
         let s = std::env::var("FLICKER_CUT").ok()?;

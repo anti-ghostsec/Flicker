@@ -198,6 +198,7 @@ pub fn ffmpeg_args(req: &EmbedRequest, existing_subs: usize) -> Vec<OsString> {
         }
     }
 
+    a.0.extend(crate::privacy::encoder_flags());
     if container == OutputContainer::Mp4 {
         a.push_all(["-movflags", "+faststart"]);
     }

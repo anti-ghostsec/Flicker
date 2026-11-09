@@ -9,9 +9,16 @@ use flicker_core::{CancelToken, Progress};
 use eframe::egui;
 
 pub const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "m4v", "webm", "avi", "ts", "flv", "wmv"];
-/// Containers Save As offers. Not WebM: saving stream-copies, and edits
-/// produce H.264/AAC, which WebM can't hold.
-pub const OUTPUT_EXTS: &[&str] = &["mp4", "mkv", "mov"];
+/// Pictures Edit > Append takes.
+pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "gif", "tif", "tiff"];
+/// Save As choices: (filter name, extension). MP4/MKV/MOV copy the streams;
+/// WebM re-encodes to VP9 + Opus.
+pub const OUTPUT_FORMATS: &[(&str, &str)] = &[
+    ("MP4 video (H.264 + AAC)", "mp4"),
+    ("WebM video (VP9 + Opus)", "webm"),
+    ("Matroska video", "mkv"),
+    ("QuickTime video", "mov"),
+];
 
 pub fn has_ext(path: &Path, exts: &[&str]) -> bool {
     path.extension()
@@ -121,22 +128,48 @@ pub fn pick_file(kind: &str, exts: &[&str]) -> Option<PathBuf> {
     rfd::FileDialog::new().add_filter(kind, exts).add_filter("All files", &["*"]).pick_file()
 }
 
-/// "Save as" dialog starting at `suggested`.
+/// Picker for Edit > Append: videos and pictures.
+#[cfg(not(target_os = "android"))]
+pub fn pick_media() -> Option<PathBuf> {
+    let all: Vec<&str> = VIDEO_EXTS.iter().chain(IMAGE_EXTS).copied().collect();
+    rfd::FileDialog::new()
+        .add_filter("Videos and pictures", &all)
+        .add_filter("Videos", VIDEO_EXTS)
+        .add_filter("Pictures", IMAGE_EXTS)
+        .add_filter("All files", &["*"])
+        .pick_file()
+}
+
+/// "Save as" dialog starting at `suggested`. A name typed without an
+/// extension gets `suggested`'s.
 #[cfg(not(target_os = "android"))]
 pub fn save_file(suggested: &Path) -> Option<PathBuf> {
-    let mut dlg = rfd::FileDialog::new().add_filter("Video", OUTPUT_EXTS);
+    let mut dlg = rfd::FileDialog::new();
+    // The suggested container first, so it's the one selected.
+    let ext = suggested.extension().and_then(|e| e.to_str()).unwrap_or("mp4").to_ascii_lowercase();
+    let mut formats = OUTPUT_FORMATS.to_vec();
+    formats.sort_by_key(|(_, e)| *e != ext);
+    for (name, e) in formats {
+        dlg = dlg.add_filter(name, &[e]);
+    }
     if let Some(dir) = suggested.parent().filter(|d| d.is_dir()) {
         dlg = dlg.set_directory(dir);
     }
     if let Some(name) = suggested.file_name() {
         dlg = dlg.set_file_name(name.to_string_lossy());
     }
-    dlg.save_file()
+    let path = dlg.save_file()?;
+    Some(if path.extension().is_none() { path.with_extension(ext) } else { path })
 }
 
 // TODO(android): use the Storage Access Framework picker via JNI.
 #[cfg(target_os = "android")]
 pub fn pick_file(_kind: &str, _exts: &[&str]) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "android")]
+pub fn pick_media() -> Option<PathBuf> {
     None
 }
 

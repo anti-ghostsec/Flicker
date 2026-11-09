@@ -14,7 +14,10 @@ use crate::engine::Engine;
 use crate::job::{CancelToken, Progress};
 use crate::media::{parse_timestamp, MediaInfo, StreamInfo, StreamKind};
 use crate::preview::{self, Frame, FrameSource, PreviewRequest};
+use crate::audio::{self, AudioRequest};
+use crate::privacy::{self, SaveRequest};
 use crate::subtitles::{ffmpeg_args, EmbedRequest};
+use crate::timeline::{self, ExportRequest};
 use crate::{Error, Result};
 
 /// How many trailing stderr lines to keep for error messages.
@@ -171,6 +174,63 @@ impl Engine for FfmpegCli {
         keys.sort();
         keys.dedup();
         Ok(keys)
+    }
+
+    fn edit_audio(
+        &self,
+        req: &AudioRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        req.validate()?;
+        let info = self.probe(&req.input)?;
+        let len = info.duration.unwrap_or_default();
+        self.run_job(&audio::audio_args(req, len), info.duration, &req.output, on_progress, cancel)
+    }
+
+    fn export_timeline(
+        &self,
+        req: &ExportRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        req.validate()?;
+        let args = timeline::export_args(req);
+        self.run_job(&args, Some(req.timeline.duration()), &req.output, on_progress, cancel)
+    }
+
+    fn save(
+        &self,
+        req: &SaveRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        req.validate()?;
+        let info = self.probe(&req.input)?;
+        if !req.changes_container() {
+            let args = privacy::scrub_args(&req.input, &req.output, &info, req.keep_tags);
+            return self.run_job(&args, None, &req.output, on_progress, cancel);
+        }
+        // Another container: convert next to the output first, then write
+        // the file privately from there.
+        let staging = privacy::staging_path(&req.output);
+        let result = (|| {
+            if req.is_webm() {
+                let args = privacy::webm_args(&req.input, &staging, &info, req.keep_tags);
+                self.run_job(&args, info.duration, &staging, on_progress, cancel)?;
+            } else {
+                // Remux without re-encoding; trim knows how to carry
+                // subtitle tracks across containers.
+                let whole = info.duration.unwrap_or_default();
+                let trim = TrimRequest::new(req.input.clone(), staging.clone(), vec![edit::TimeRange::new(Duration::ZERO, whole)]);
+                self.trim(&trim, on_progress, cancel)?;
+            }
+            let info = self.probe(&staging)?;
+            let args = privacy::scrub_args(&staging, &req.output, &info, req.keep_tags);
+            self.run_job(&args, None, &req.output, &mut |_| {}, cancel)
+        })();
+        let _ = std::fs::remove_file(&staging);
+        result
     }
 
     fn open_preview(&self, req: &PreviewRequest) -> Result<Box<dyn FrameSource>> {

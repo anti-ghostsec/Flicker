@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("could not find `{0}`. Install FFmpeg or set its path in Settings")]
+    #[error("could not find `{0}`. Install FFmpeg, or put ffmpeg and ffprobe next to the flicker program")]
     ToolNotFound(String),
 
     #[error("file not found: {0}")]

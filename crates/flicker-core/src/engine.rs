@@ -5,7 +5,10 @@ use crate::edit::TrimRequest;
 use crate::job::{CancelToken, Progress};
 use crate::media::MediaInfo;
 use crate::preview::{FrameSource, PreviewRequest};
+use crate::audio::AudioRequest;
+use crate::privacy::SaveRequest;
 use crate::subtitles::EmbedRequest;
+use crate::timeline::ExportRequest;
 use crate::Result;
 
 /// A media backend. Implementations must be usable from a worker thread.
@@ -32,6 +35,32 @@ pub trait Engine: Send + Sync {
     fn trim(
         &self,
         req: &TrimRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()>;
+
+    /// Change the sound of a whole video (volume, mute, fades); the picture
+    /// is copied untouched.
+    fn edit_audio(
+        &self,
+        req: &AudioRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()>;
+
+    /// Render clips one after another (with transitions) into one file.
+    fn export_timeline(
+        &self,
+        req: &ExportRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()>;
+
+    /// Write a file the user keeps, without source tags and, unless asked
+    /// for, without encoder names or dates (see [`crate::privacy`]).
+    fn save(
+        &self,
+        req: &SaveRequest,
         on_progress: &mut dyn FnMut(Progress),
         cancel: &CancelToken,
     ) -> Result<()>;

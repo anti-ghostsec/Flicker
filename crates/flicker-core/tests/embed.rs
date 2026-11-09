@@ -6,7 +6,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use flicker_core::{
-    Accuracy, CancelToken, EmbedMode, EmbedRequest, Engine, FfmpegCli, MediaInfo, Selection,
+    Accuracy, AudioEdit, AudioRequest, CancelToken, EmbedMode, EmbedRequest, Engine, FfmpegCli, MediaInfo,
+    SaveRequest, Selection,
     StreamKind, TimeRange, TrimRequest,
 };
 
@@ -422,4 +423,103 @@ fn precise_cut_keeps_subtitles_across_parts() {
     let Some(out) = trim_subbed("subs-precise-multi", &sel, Accuracy::Precise) else { return };
     assert_clean_timeline(&out, 10.0);
     assert_cues(&out, &[(1.0, 2.0, "A"), (4.0, 5.0, "C"), (6.0, 7.0, "D")]);
+}
+
+fn tags(path: &Path) -> String {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format_tags:stream_tags", "-of", "default"])
+        .arg(path)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).to_lowercase()
+}
+
+#[test]
+fn saves_carry_no_source_encoder_or_date_tags() {
+    let Some(dir) = workdir("tags") else { return };
+    let (video, subs) = (dir.join("in.mp4"), dir.join("subs.srt"));
+    // A "phone video": title, location and a date in the file.
+    let ok = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=4"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=4", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .args(["-c:a", "aac", "-shortest", "-metadata", "title=Holiday", "-metadata", "location=+48.85+002.35/"])
+        .args(["-metadata", "creation_time=2026-01-02T03:04:05Z"])
+        .arg(&video)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    std::fs::write(&subs, SRT).unwrap();
+
+    // An edit (a precise cut), then subtitles with a language, then Save As.
+    let cut = dir.join("step1.mp4");
+    let mut req = TrimRequest::new(video, cut.clone(), vec![TimeRange::new(Duration::from_secs(1), Duration::from_secs(3))]);
+    req.accuracy = Accuracy::Precise;
+    req.preset = "ultrafast".into();
+    FfmpegCli::locate().trim(&req, &mut |_| {}, &CancelToken::new()).unwrap();
+    let step = dir.join("step2.mp4");
+    let mut req = EmbedRequest::new(cut, subs, step.clone());
+    req.language = Some("ger".into());
+    run(&req);
+
+    for out in [dir.join("out.mp4"), dir.join("out.mkv")] {
+        let save = SaveRequest::new(step.clone(), out.clone());
+        FfmpegCli::locate().save(&save, &mut |_| {}, &CancelToken::new()).unwrap_or_else(|e| panic!("{e}"));
+        let tags = tags(&out);
+        for bad in ["creation_time", "holiday", "location", "lavc", "lavf5", "lavf6"] {
+            assert!(!tags.contains(bad), "{bad} in {}: {tags}", out.display());
+        }
+        // Matroska must name the writing program: with bitexact it's just
+        // "Lavf", no version. MP4 names nothing.
+        let mp4 = out.extension().unwrap() == "mp4";
+        assert!(!mp4 || !tags.contains("encoder"), "{tags}");
+        let bytes = std::fs::read(&out).unwrap();
+        for bad in [&b"x264"[..], b"Lavc"] {
+            assert!(!bytes.windows(4).any(|w| w == bad), "encoder version left in {}", out.display());
+        }
+        assert!(!mp4 || !bytes.windows(4).any(|w| w == b"Lavf"));
+        let info = FfmpegCli::locate().probe(&out).unwrap();
+        let sub = info.streams.iter().find(|s| s.kind == StreamKind::Subtitle).expect("subtitle track kept");
+        assert_eq!(sub.language.as_deref(), Some("ger"), "track language kept");
+        assert!(!dir.join(".out.flicker-part.mkv").exists());
+    }
+}
+
+#[test]
+fn audio_edits_keep_the_picture() {
+    let Some(dir) = workdir("audio") else { return };
+    let video = dir.join("in.mp4");
+    make_video(&video);
+    let engine = FfmpegCli::locate();
+    let volume = |path: &Path| -> f64 {
+        let out = Command::new("ffmpeg")
+            .args(["-v", "info", "-nostats", "-i"])
+            .arg(path)
+            .args(["-af", "volumedetect", "-f", "null", "-"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stderr).into_owned();
+        let line = log.lines().find(|l| l.contains("mean_volume:")).unwrap_or_else(|| panic!("{log}"));
+        line.split("mean_volume:").nth(1).unwrap().trim().trim_end_matches(" dB").parse().unwrap()
+    };
+    let before = volume(&video);
+
+    let quiet = dir.join("quiet.mp4");
+    let req = AudioRequest::new(video.clone(), quiet.clone(), AudioEdit::Volume(0.5));
+    engine.edit_audio(&req, &mut |_| {}, &CancelToken::new()).unwrap();
+    let after = volume(&quiet);
+    assert!((before - after - 6.0).abs() < 1.0, "half volume is about -6 dB: {before} → {after}");
+    let info = engine.probe(&quiet).unwrap();
+    assert_eq!(info.first_video().unwrap().codec, "h264");
+
+    let faded = dir.join("faded.mkv");
+    let fade = AudioEdit::Fade { fade_in: Duration::from_secs(2), fade_out: Duration::from_secs(2) };
+    engine.edit_audio(&AudioRequest::new(video.clone(), faded.clone(), fade), &mut |_| {}, &CancelToken::new()).unwrap();
+    assert!(volume(&faded) < before - 1.0);
+
+    let muted = dir.join("muted.mp4");
+    engine.edit_audio(&AudioRequest::new(video, muted.clone(), AudioEdit::Mute), &mut |_| {}, &CancelToken::new()).unwrap();
+    let info = engine.probe(&muted).unwrap();
+    assert_eq!(info.count(StreamKind::Audio), 0);
+    assert_eq!(info.count(StreamKind::Video), 1);
 }

@@ -5,6 +5,7 @@ mod app;
 mod common;
 pub mod player;
 mod session;
+mod settings;
 mod theme;
 mod timeline;
 
