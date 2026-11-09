@@ -1,21 +1,31 @@
-//! Video player: decodes on a background thread, shows frames scaled to fit,
-//! draws an optional subtitle overlay, and can loop over a set of ranges (the
-//! live preview of a cut). Transport controls live in the app.
+//! The player: plays the timeline as it is right now, with sound, from the
+//! playhead. There's no render step: every change to the timeline restarts
+//! decoding at the same spot (playing on if it was playing), and while
+//! paused the frame under the playhead is decoded on its own (the newest
+//! request wins, recent frames are kept for instant scrubbing back).
 
-use std::path::PathBuf;
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use flicker_core::{Engine, Frame, PreviewRequest, TimeRange};
 use eframe::egui::{self, Color32, ColorImage, TextureHandle, TextureOptions};
+use flicker_core::{Canvas, Engine, Frame, Timeline, TimelinePreview};
 
-/// Frames buffered ahead of the playhead. Small, so seeking stays snappy.
+use crate::sound::{self, Playback};
+
+/// Frames buffered ahead of the playhead. Small, so restarting stays snappy.
 const BUFFER: usize = 4;
-/// A frame this close before a range's start still counts as inside it
-/// (decoders land a hair early), so looping can't bounce forever.
-const SLACK: Duration = Duration::from_millis(80);
+/// Largest preview frame. The picture is scaled up to fill the window.
+const PREVIEW_W: u32 = 960;
+const PREVIEW_H: u32 = 540;
+const PREVIEW_FPS: f64 = 30.0;
+/// While playing, wait this long after the last edit before restarting, so
+/// dragging a slider doesn't restart ffmpeg on every step.
+const EDIT_SETTLE: Duration = Duration::from_millis(120);
+/// Scrubbed frames kept.
+const CACHE: usize = 16;
 
 enum Msg {
     Frame(Frame),
@@ -23,17 +33,22 @@ enum Msg {
     Error(String),
 }
 
-/// A running decoder thread. Dropping it stops decoding: the thread's next
-/// send fails, it exits, and the ffmpeg process is killed.
+/// A decoder thread. Dropping it stops decoding: the thread's next send
+/// fails, it exits, and ffmpeg is killed.
 struct Decoder {
     rx: Receiver<Msg>,
+    /// For a single-frame decode: what it's for (timeline revision, time).
+    target: Option<(u64, Duration)>,
+    started: Instant,
+    /// Its first frame has been reported to the sync log.
+    logged: bool,
 }
 
 impl Decoder {
-    fn spawn(engine: Arc<dyn Engine>, req: PreviewRequest, ctx: egui::Context) -> Self {
+    fn spawn(engine: Arc<dyn Engine>, req: TimelinePreview, ctx: egui::Context, target: Option<(u64, Duration)>) -> Self {
         let (tx, rx) = mpsc::sync_channel(BUFFER);
         thread::spawn(move || {
-            let mut source = match engine.open_preview(&req) {
+            let mut source = match engine.open_timeline_frames(&req) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = tx.send(Msg::Error(e.to_string()));
@@ -55,75 +70,98 @@ impl Decoder {
             }
             ctx.request_repaint();
         });
-        Self { rx }
+        Self { rx, target, started: Instant::now(), logged: false }
     }
+}
+
+/// What the picture's clock follows while playing.
+enum Clock {
+    /// The sound card (the normal case).
+    Sound(Playback),
+    /// No sound: the wall clock, from when the first frame arrived.
+    Wall(Option<(Instant, Duration)>),
 }
 
 pub struct Player {
     engine: Arc<dyn Engine>,
-    video: PathBuf,
-    subtitle: Option<PathBuf>,
+    timeline: Arc<Timeline>,
+    /// Bumped on every change, to tell cached frames apart.
+    revision: u64,
+    canvas: Canvas,
+    duration: Duration,
     show_subtitles: bool,
-    duration: Option<Duration>,
-    fps: f64,
 
     texture: Option<TextureHandle>,
-    /// Timestamp of the frame on screen (or where we'll seek to).
+    /// The playhead.
     position: Duration,
     playing: bool,
+    /// Restart decoding (at `position`) once `restart_at` has passed.
+    restart: bool,
+    restart_at: Instant,
     decoder: Option<Decoder>,
-    needs_decoder: bool,
-    /// Wall-clock instant matching `clock_pts`, set when the first frame arrives
-    /// so ffmpeg's startup delay doesn't make us skip frames.
-    clock: Option<(Instant, Duration)>,
+    clock: Option<Clock>,
+    /// Where the current playback started.
+    play_from: Duration,
     /// Next frame, decoded but not due yet.
     queued: Option<Frame>,
-    /// When set, playback only visits these (sorted) ranges, jumping from the
-    /// end of one to the start of the next and looping back to the first.
-    play_ranges: Option<Vec<TimeRange>>,
-    /// A frame was played since the decoder last (re)started, so reaching the
-    /// end means `position` is the real last frame.
-    shown_this_run: bool,
+    /// The picture has ended; waiting for the sound to finish.
+    picture_done: bool,
+    /// What's on screen: (revision, time).
+    shown: Option<(u64, Duration)>,
+    cache: VecDeque<(u64, Duration, Frame)>,
     error: Option<String>,
+    /// Why there's no sound, for the status bar.
+    sound_note: Option<String>,
+    sync_log: Option<std::fs::File>,
 }
 
 impl Player {
-    pub fn new(
-        engine: Arc<dyn Engine>,
-        video: PathBuf,
-        duration: Option<Duration>,
-        source_fps: Option<f64>,
-    ) -> Self {
+    pub fn new(engine: Arc<dyn Engine>) -> Self {
+        let sync_log = std::env::var_os("FLICKER_SYNC_LOG").and_then(|p| std::fs::File::create(p).ok());
         Self {
             engine,
-            video,
-            subtitle: None,
+            timeline: Arc::new(Timeline::default()),
+            revision: 0,
+            canvas: Canvas::default().fit_within(PREVIEW_W, PREVIEW_H, PREVIEW_FPS),
+            duration: Duration::ZERO,
             show_subtitles: true,
-            duration,
-            fps: PreviewRequest::preview_fps(source_fps),
             texture: None,
             position: Duration::ZERO,
-            // Developer aid (see app.rs `dev`): start playing immediately.
-            playing: std::env::var_os("FLICKER_AUTOPLAY").is_some(),
+            playing: false,
+            restart: true,
+            restart_at: Instant::now(),
             decoder: None,
-            needs_decoder: true,
             clock: None,
+            play_from: Duration::ZERO,
             queued: None,
-            play_ranges: None,
-            shown_this_run: false,
+            picture_done: false,
+            shown: None,
+            cache: VecDeque::new(),
             error: None,
+            sound_note: None,
+            sync_log,
         }
     }
 
-    pub fn set_subtitle(&mut self, path: Option<PathBuf>) {
-        if self.subtitle != path {
-            self.subtitle = path;
-            self.restart();
+    /// Show this version of the timeline from now on.
+    pub fn set_timeline(&mut self, timeline: Arc<Timeline>) {
+        if *timeline == *self.timeline {
+            return;
         }
-    }
-
-    pub fn has_subtitle(&self) -> bool {
-        self.subtitle.is_some()
+        self.canvas = timeline.suggested_canvas().fit_within(PREVIEW_W, PREVIEW_H, PREVIEW_FPS);
+        self.duration = timeline.duration();
+        self.timeline = timeline;
+        self.revision += 1;
+        self.cache.clear();
+        self.error = None;
+        if self.position > self.duration {
+            self.position = self.duration;
+        }
+        if self.duration.is_zero() {
+            self.playing = false;
+        }
+        let settle = if self.playing { EDIT_SETTLE } else { Duration::ZERO };
+        self.schedule(settle);
     }
 
     pub fn show_subtitles(&self) -> bool {
@@ -133,36 +171,17 @@ impl Player {
     pub fn set_show_subtitles(&mut self, show: bool) {
         if self.show_subtitles != show {
             self.show_subtitles = show;
-            self.restart();
+            self.revision += 1;
+            self.cache.clear();
+            self.schedule(Duration::ZERO);
         }
     }
 
-    /// Restrict playback to `ranges` (looping), or `None` for the whole video.
-    pub fn set_play_ranges(&mut self, ranges: Option<Vec<TimeRange>>) {
-        let ranges = ranges.filter(|r| !r.is_empty());
-        if self.play_ranges == ranges {
-            return;
-        }
-        self.play_ranges = ranges;
-        if self.playing && self.jump_target(self.position).is_some() {
-            self.restart_at_range();
-        }
-    }
-
-    /// Stop playback (e.g. while an edit is running).
-    pub fn pause(&mut self) {
-        if self.playing {
-            self.playing = false;
-            self.restart();
-        }
-    }
-
-    /// Timestamp of the frame on screen.
     pub fn position(&self) -> Duration {
         self.position
     }
 
-    pub fn duration(&self) -> Option<Duration> {
+    pub fn duration(&self) -> Duration {
         self.duration
     }
 
@@ -174,150 +193,251 @@ impl Player {
         self.error.as_deref()
     }
 
+    /// Why playback is silent, if it is.
+    pub fn sound_note(&self) -> Option<&str> {
+        self.sound_note.as_deref()
+    }
+
+    pub fn frame_len(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.canvas.fps)
+    }
+
     pub fn seek(&mut self, to: Duration) {
-        self.position = self.duration.map_or(to, |d| to.min(d));
-        self.restart();
+        let to = to.min(self.duration);
+        if to == self.position && !self.restart && (self.playing || self.shown == Some((self.revision, to))) {
+            return;
+        }
+        self.position = to;
+        self.schedule(Duration::ZERO);
+    }
+
+    pub fn pause(&mut self) {
+        if self.playing {
+            self.playing = false;
+            self.schedule(Duration::ZERO);
+        }
     }
 
     pub fn toggle_play(&mut self) {
-        self.playing = !self.playing;
-        if self.playing {
-            let at_end = self.duration.is_some_and(|d| self.position + Duration::from_millis(100) >= d);
-            if at_end && self.play_ranges.is_none() {
-                // At the end: play again from the start.
-                self.position = Duration::ZERO;
-            }
-            if self.jump_target(self.position).is_some() {
-                self.restart_at_range();
-                return;
-            }
-        }
-        self.restart();
-    }
-
-    /// Playback just ran off the end at `position`. If the file claimed to be
-    /// longer than its last frame, shrink to fit so the timeline ends where
-    /// the picture does.
-    fn learn_end(&mut self) {
-        let frame = Duration::from_secs_f64(1.0 / self.fps);
-        let end = self.position + frame;
-        if self.duration.is_some_and(|d| d > end + frame) {
-            self.duration = Some(end);
-        }
-    }
-
-    /// Where playback should continue if `t` is outside the play ranges:
-    /// the next range's start, wrapping to the first. `None` = keep going.
-    fn jump_target(&self, t: Duration) -> Option<Duration> {
-        let ranges = self.play_ranges.as_ref()?;
-        if ranges.iter().any(|r| t + SLACK >= r.start && t < r.end) {
-            return None;
-        }
-        let next = ranges.iter().find(|r| r.start > t).unwrap_or(&ranges[0]);
-        Some(next.start)
-    }
-
-    fn restart_at_range(&mut self) {
-        if let Some(t) = self.jump_target(self.position) {
-            self.position = t;
-        }
-        self.restart();
-    }
-
-    /// Throw away the current decoder and start a new one at `position`.
-    fn restart(&mut self) {
-        self.decoder = None;
-        self.queued = None;
-        self.clock = None;
-        self.error = None;
-        self.shown_this_run = false;
-        self.needs_decoder = true;
-    }
-
-    fn ensure_decoder(&mut self, ctx: &egui::Context) {
-        if !self.needs_decoder {
+        if self.duration.is_zero() {
             return;
         }
-        self.needs_decoder = false;
-        let mut req = PreviewRequest::new(self.video.clone());
-        req.start = self.position;
-        req.fps = self.fps;
-        req.single_frame = !self.playing;
-        req.subtitle = self.subtitle.clone().filter(|_| self.show_subtitles);
-        self.decoder = Some(Decoder::spawn(self.engine.clone(), req, ctx.clone()));
+        self.playing = !self.playing;
+        if self.playing && self.position + self.frame_len() >= self.duration {
+            // At the end: play again from the start.
+            self.position = Duration::ZERO;
+        }
+        self.schedule(Duration::ZERO);
     }
 
-    fn show_frame(&mut self, ctx: &egui::Context, frame: Frame) {
+    /// Restart decoding at `position` after `after`.
+    fn schedule(&mut self, after: Duration) {
+        if !self.playing || after.is_zero() {
+            self.stop_decoding();
+        }
+        self.restart = true;
+        self.restart_at = Instant::now() + after;
+    }
+
+    fn stop_decoding(&mut self) {
+        // A single-frame decode in flight is left to finish: its frame is
+        // close to what's wanted and shows sooner than a new one would.
+        if self.decoder.as_ref().is_some_and(|d| d.target.is_none()) {
+            self.decoder = None;
+        }
+        self.clock = None;
+        self.queued = None;
+        self.picture_done = false;
+    }
+
+    fn request(&self, single: bool) -> TimelinePreview {
+        TimelinePreview {
+            timeline: self.timeline.clone(),
+            canvas: self.canvas,
+            start: self.position,
+            subtitles: self.show_subtitles,
+            single_frame: single,
+        }
+    }
+
+    fn start(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if now < self.restart_at {
+            ctx.request_repaint_after(self.restart_at - now);
+            return;
+        }
+        if self.playing {
+            self.stop_decoding();
+            self.decoder = None;
+            self.decoder = Some(Decoder::spawn(self.engine.clone(), self.request(false), ctx.clone(), None));
+            self.play_from = self.position;
+            let audible = self.timeline.tracks().any(|(_, t)| !t.muted && t.clips.iter().any(|c| c.audible()));
+            self.clock = Some(if audible {
+                Clock::Sound(Playback::start(self.engine.clone(), self.request(false)))
+            } else {
+                Clock::Wall(None)
+            });
+            self.restart = false;
+            return;
+        }
+        // Paused: one frame. A decode already in flight finishes first.
+        let target = (self.revision, self.position);
+        if self.shown == Some(target) {
+            self.restart = false;
+            return;
+        }
+        if let Some(i) = self.cached(target) {
+            let frame = self.cache[i].2.clone();
+            self.show(ctx, frame, target);
+            self.restart = false;
+            return;
+        }
+        if self.decoder.is_none() {
+            self.decoder = Some(Decoder::spawn(self.engine.clone(), self.request(true), ctx.clone(), Some(target)));
+            self.restart = false;
+        }
+    }
+
+    fn cached(&self, (rev, t): (u64, Duration)) -> Option<usize> {
+        let half = self.frame_len() / 2;
+        self.cache.iter().position(|(r, ct, _)| *r == rev && ct.abs_diff(t) <= half)
+    }
+
+    fn show(&mut self, ctx: &egui::Context, frame: Frame, at: (u64, Duration)) {
         let size = [frame.width as usize, frame.height as usize];
         let image = ColorImage::from_rgb(size, &frame.rgb);
         match &mut self.texture {
             Some(t) => t.set(image, TextureOptions::LINEAR),
             None => self.texture = Some(ctx.load_texture("preview", image, TextureOptions::LINEAR)),
         }
-        self.position = frame.pts;
+        self.shown = Some(at);
+    }
+
+    /// The playback clock: where the timeline is now. `None` = not yet.
+    fn now(&mut self, first_pts: Duration) -> Option<Duration> {
+        match self.clock.as_mut()? {
+            Clock::Sound(p) => match p.state() {
+                sound::State::Starting => None,
+                sound::State::Playing(..) => {
+                    self.sound_note = None;
+                    p.clock().map(|d| self.play_from + d)
+                }
+                sound::State::Finished => Some(self.duration),
+                sound::State::Unavailable(why) => {
+                    // Carry on silently, from where the sound got to.
+                    self.sound_note = Some(why);
+                    self.clock = Some(Clock::Wall(Some((Instant::now(), first_pts))));
+                    Some(first_pts)
+                }
+            },
+            Clock::Wall(origin) => {
+                let (start, pts) = *origin.get_or_insert((Instant::now(), first_pts));
+                Some(pts + start.elapsed())
+            }
+        }
+    }
+
+    fn sound_finished(&self) -> bool {
+        match &self.clock {
+            Some(Clock::Sound(p)) => !matches!(p.state(), sound::State::Playing(..) | sound::State::Starting),
+            _ => true,
+        }
     }
 
     /// Pull due frames from the decoder and schedule the next repaint.
     fn pump(&mut self, ctx: &egui::Context) {
-        self.ensure_decoder(ctx);
+        if self.restart {
+            self.start(ctx);
+        }
         loop {
             let frame = match self.queued.take() {
                 Some(f) => f,
                 None => {
-                    let Some(dec) = &self.decoder else { return };
+                    let Some(dec) = &self.decoder else { break };
                     match dec.rx.try_recv() {
                         Ok(Msg::Frame(f)) => f,
-                        Ok(Msg::End) => {
+                        Ok(Msg::End) | Err(TryRecvError::Disconnected) => {
+                            let single = dec.target.is_some();
                             self.decoder = None;
-                            if self.playing {
-                                if self.shown_this_run {
-                                    self.learn_end();
+                            if single {
+                                if self.restart {
+                                    self.start(ctx);
                                 }
-                                // Loop: back to the start (of the first play range).
-                                self.position = self.play_ranges.as_ref().map_or(Duration::ZERO, |r| r[0].start);
-                                self.restart();
-                                ctx.request_repaint();
+                            } else {
+                                self.picture_done = true;
                             }
-                            return;
-                        }
-                        Err(TryRecvError::Disconnected) => {
-                            self.decoder = None;
-                            self.playing = false;
-                            return;
+                            break;
                         }
                         Ok(Msg::Error(e)) => {
                             self.error = Some(e);
                             self.decoder = None;
                             self.playing = false;
-                            return;
+                            self.clock = None;
+                            break;
                         }
-                        Err(TryRecvError::Empty) => return,
+                        Err(TryRecvError::Empty) => break,
                     }
                 }
             };
 
-            if !self.playing {
-                self.show_frame(ctx, frame);
+            if let (Some(log), Some(d)) = (&mut self.sync_log, &mut self.decoder) {
+                // How long the first frame took to arrive (FLICKER_SYNC_LOG).
+                if !d.logged {
+                    use std::io::Write;
+                    d.logged = true;
+                    let kind = if d.target.is_some() { "frame" } else { "play" };
+                    let _ = writeln!(log, "# {kind} {:.0} ms", d.started.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            if let Some(target) = self.decoder.as_ref().and_then(|d| d.target) {
+                // A scrubbed frame.
+                self.cache.push_back((target.0, target.1, frame.clone()));
+                if self.cache.len() > CACHE {
+                    self.cache.pop_front();
+                }
+                self.show(ctx, frame, target);
                 continue;
             }
-            if let Some(t) = self.jump_target(frame.pts) {
-                // Left the play ranges: continue at the next one.
-                self.position = t;
-                self.restart();
-                ctx.request_repaint();
-                return;
+            if !self.playing {
+                continue;
             }
-            let (start, start_pts) = *self.clock.get_or_insert((Instant::now(), frame.pts));
-            let now = start_pts + start.elapsed();
+            if let Some(Clock::Sound(p)) = &self.clock {
+                // The first picture is here: let the sound start.
+                p.go();
+            }
+            let Some(now) = self.now(frame.pts) else {
+                // Waiting for the sound to start.
+                self.queued = Some(frame);
+                ctx.request_repaint_after(Duration::from_millis(5));
+                return;
+            };
             if frame.pts <= now {
-                // Due (or late): show it, then see if a newer one is also due.
-                self.show_frame(ctx, frame);
-                self.shown_this_run = true;
+                // Due (or late): show it, then see if a newer one is due too.
+                if let Some(log) = &mut self.sync_log {
+                    use std::io::Write;
+                    let _ = writeln!(log, "{:.4} {:.4}", now.as_secs_f64(), frame.pts.as_secs_f64());
+                }
+                self.position = frame.pts;
+                let at = (self.revision, frame.pts);
+                self.show(ctx, frame, at);
             } else {
-                ctx.request_repaint_after(frame.pts - now);
+                ctx.request_repaint_after((frame.pts - now).min(Duration::from_millis(20)));
                 self.queued = Some(frame);
                 return;
             }
+        }
+        if self.playing && self.picture_done && self.queued.is_none() {
+            if self.sound_finished() {
+                self.playing = false;
+                self.clock = None;
+                self.picture_done = false;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(20));
+            }
+        }
+        if self.playing && self.decoder.is_some() {
+            // Frames arrive with a repaint; this keeps the clock moving.
+            ctx.request_repaint_after(Duration::from_millis(30));
         }
     }
 
@@ -330,20 +450,22 @@ impl Player {
         let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::BLACK);
-        match &self.texture {
-            Some(tex) => {
+        let empty = self.timeline.is_empty();
+        match (&self.texture, empty) {
+            (Some(tex), false) => {
                 let [w, h] = tex.size().map(|v| v as f32);
                 let scale = (rect.width() / w).min(rect.height() / h);
                 let picture = egui::Rect::from_center_size(rect.center(), egui::vec2(w * scale, h * scale));
                 let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                 painter.image(tex.id(), picture, uv, Color32::WHITE);
             }
-            None => {
-                let msg = match &self.error {
-                    Some(e) => last_line(e),
-                    None => "Loading…",
+            _ => {
+                let msg = match (&self.error, empty) {
+                    (Some(e), _) => last_line(e),
+                    (None, true) => "File > Add to Timeline…  or drop videos, pictures and music here",
+                    (None, false) => "Loading…",
                 };
-                painter.text(rect.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(14.0), Color32::GRAY);
+                painter.text(rect.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(15.0), Color32::GRAY);
             }
         }
     }

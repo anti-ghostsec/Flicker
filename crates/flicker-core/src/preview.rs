@@ -56,6 +56,43 @@ impl std::fmt::Debug for Frame {
     }
 }
 
+/// The live preview of the timeline from `start` on.
+#[derive(Clone, Debug)]
+pub struct TimelinePreview {
+    pub timeline: std::sync::Arc<crate::Timeline>,
+    /// Preview frame size and rate (small, to stay quick).
+    pub canvas: crate::Canvas,
+    pub start: Duration,
+    /// Draw the timeline's subtitle file on the picture.
+    pub subtitles: bool,
+    /// Decode a single frame (scrubbing, or showing an edit while paused).
+    pub single_frame: bool,
+}
+
+/// How much of the timeline one preview ffmpeg process renders. The preview
+/// plays a chain of these (the next one starts while the current one
+/// plays), so only the files that play in the next few seconds are open.
+pub const PREVIEW_STRETCH: Duration = Duration::from_secs(8);
+
+/// `start..total` in [`PREVIEW_STRETCH`] pieces.
+pub fn stretches(start: Duration, total: Duration) -> Vec<(Duration, Duration)> {
+    let mut out = Vec::new();
+    let mut t = start;
+    while t + Duration::from_millis(1) < total {
+        let end = (t + PREVIEW_STRETCH).min(total);
+        out.push((t, end));
+        t = end;
+    }
+    out
+}
+
+/// Sound as 48 kHz stereo signed 16-bit little-endian PCM.
+pub trait PcmSource: Send {
+    /// Fill `buf` with up to `buf.len()` bytes (always whole sample frames
+    /// of 4 bytes). 0 at the end.
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+}
+
 /// A stream of decoded frames. Dropping it stops decoding.
 pub trait FrameSource: Send {
     /// The next frame, or `None` at the end of the video.
@@ -154,6 +191,13 @@ mod tests {
         assert_eq!(read_ppm(&mut r).unwrap(), Some((2, 1, vec![1, 2, 3, 4, 5, 6])));
         assert_eq!(read_ppm(&mut r).unwrap(), Some((1, 1, vec![10, 32, 30])));
         assert_eq!(read_ppm(&mut r).unwrap(), None);
+    }
+
+    #[test]
+    fn stretches_cover_the_rest_of_the_timeline() {
+        let s = |n| Duration::from_secs(n);
+        assert_eq!(stretches(s(3), s(20)), vec![(s(3), s(11)), (s(11), s(19)), (s(19), s(20))]);
+        assert!(stretches(s(20), s(20)).is_empty());
     }
 
     #[test]

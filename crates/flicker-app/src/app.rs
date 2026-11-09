@@ -2,19 +2,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flicker_core::media::format_timestamp;
-use flicker_core::{
-    Accuracy, AudioEdit, AudioRequest, Clip, EmbedMode, EmbedRequest, Engine, ExportRequest, FfmpegCli, MediaInfo,
-    SaveRequest, Selection, StreamKind, SubtitleFormat, TimeRange, Timeline, Transition, TransitionKind, TrimRequest,
-};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
+use flicker_core::media::{format_duration, format_timestamp};
+use flicker_core::{
+    project, Clip, ClipKind, ClipRef, Engine, ExportRequest, FfmpegCli, StreamKind, SubtitleExport, SubtitleFormat,
+    Timeline, TrackKind, TrackRef,
+};
 
-use crate::common::{dropped_files, has_ext, pick_file, pick_media, save_file, JobRunner, IMAGE_EXTS, VIDEO_EXTS};
-use crate::settings::Settings;
+use crate::common::{
+    dropped_files, has_ext, pick_file, pick_media, save_file, save_project_file, JobRunner, AUDIO_EXTS, IMAGE_EXTS,
+};
 use crate::player::{last_line, Player};
-use crate::session::{Session, Step};
+use crate::project::Project;
+use crate::settings::Settings;
 use crate::theme::{self, Theme};
-use crate::timeline::{self, Cut};
+use crate::timeline::TimelineView;
 
 const LANGUAGES: &[(&str, &str)] = &[
     ("", "(none)"),
@@ -33,87 +35,38 @@ const LANGUAGES: &[(&str, &str)] = &[
     ("chi", "Chinese"),
 ];
 
-/// How often a dragged handle refreshes the picture (each refresh restarts
-/// the decoder).
-const PREVIEW_EVERY: Duration = Duration::from_millis(70);
-
 const SHORTCUTS: &[(&str, &str)] = &[
     ("Space", "Play / pause"),
-    ("← / →", "Back / forward 5 seconds"),
-    ("C", "Start or leave cut mode"),
-    ("I / O", "Move the start / end handle to the playhead"),
-    ("Enter", "Apply the cut"),
-    ("Esc", "Cancel the cut"),
+    ("← / →", "One frame back / forward"),
+    ("Shift+← / →", "5 seconds back / forward"),
+    ("Home / End", "Start / end of the timeline"),
+    ("S", "Split the selected clip (or every clip) at the playhead"),
+    ("Del", "Delete the selected clip, leaving a gap"),
+    ("Shift+Del", "Ripple delete: delete it and close the gap"),
+    ("Esc", "Unselect"),
+    ("+ / -", "Zoom the timeline in / out"),
+    ("Ctrl+wheel", "Zoom the timeline around the pointer"),
+    ("Wheel / Shift+wheel", "Scroll the timeline"),
     ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
-    ("Ctrl+O / Ctrl+S", "Open / save as"),
+    ("Ctrl+N / Ctrl+O", "New / open project"),
+    ("Ctrl+S / Ctrl+Shift+S", "Save project / save project as"),
+    ("Ctrl+I", "Add files to the timeline"),
+    ("Ctrl+E", "Export video"),
 ];
 
-/// The open video: its edit history and what's on screen now.
-struct Video {
-    session: Session,
-    info: MediaInfo,
-    player: Player,
-}
+/// How long to wait after a drop from the file manager for the pointer to
+/// say where it was (X11 doesn't tell during a drag).
+const DROP_WAIT: Duration = Duration::from_millis(400);
 
-impl Video {
-    fn total(&self) -> Duration {
-        self.player.duration().unwrap_or_default()
-    }
-
-    fn name(&self) -> String {
-        file_name(self.session.original())
-    }
-
-    fn has_audio(&self) -> bool {
-        self.info.count(StreamKind::Audio) > 0
-    }
-
-    /// The current video as the first clip of an Append.
-    fn as_clip(&self) -> Clip {
-        clip_from(self.session.current().to_path_buf(), &self.info, self.total())
-    }
-}
-
-/// A clip for a probed video, playing it whole.
-fn clip_from(path: PathBuf, info: &MediaInfo, len: Duration) -> Clip {
-    let mut c = Clip::video(path, len, info.count(StreamKind::Audio) > 0);
-    if let Some(v) = info.first_video() {
-        (c.width, c.height, c.fps) = (v.width, v.height, v.frame_rate);
-    }
-    c
-}
-
-/// How an appended clip starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Join {
-    Cut,
-    Crossfade,
-    DipToBlack,
-}
-
-/// Edit > Append's dialog.
-struct AppendForm {
-    /// The file to append, probed.
-    clip: Clip,
-    is_picture: bool,
-    picture_secs: f32,
-    join: Join,
-    join_secs: f32,
-}
-
-/// What a background job is for, so its result can be put to use.
 enum Job {
-    /// An edit writing a new step.
-    Edit { label: String, output: PathBuf, subtitle: Option<PathBuf>, seek_to: Duration },
-    /// Saving the current video, then maybe carrying on with what the save
-    /// was asked for.
-    Save { to: PathBuf, then: Option<Pending> },
+    Export { to: PathBuf },
 }
 
 /// Something waiting for the user to decide about unsaved changes.
 #[derive(Clone, Debug)]
 enum Pending {
     Quit,
+    New,
     Open(PathBuf),
 }
 
@@ -122,17 +75,12 @@ enum Dialog {
     Shortcuts,
     About,
     Error(String),
-    Append(AppendForm),
-    /// Audio > Volume, in percent.
-    Volume(f32),
-    /// Audio > Fade In/Out, in seconds.
-    Fade { fade_in: f32, fade_out: f32 },
 }
 
-/// What a dialog's OK asks for.
-enum DialogAction {
-    Append(Clip),
-    Audio(AudioEdit),
+/// Files dropped from the file manager, waiting for the pointer position.
+struct Drop {
+    files: Vec<PathBuf>,
+    since: Instant,
 }
 
 pub struct FlickerApp {
@@ -140,10 +88,11 @@ pub struct FlickerApp {
     theme: Theme,
     /// "Write encoder name and dates into saved files".
     write_tags: bool,
-    video: Option<Video>,
-    cut: Option<Cut>,
-    accuracy: Accuracy,
-    language: String,
+    project: Project,
+    player: Player,
+    view: TimelineView,
+    /// The project version the player shows.
+    shown_version: Option<u64>,
     job: JobRunner<Job>,
     dialog: Option<Dialog>,
     /// Status-bar message: text and whether it's an error.
@@ -151,9 +100,7 @@ pub struct FlickerApp {
     /// Set once the user agreed to quit with unsaved changes.
     allow_close: bool,
     title: String,
-    last_preview: Instant,
-    /// Resume playback once the handle drag that paused it ends.
-    resume_after_drag: bool,
+    drop: Option<Drop>,
     dev_screenshot: Option<dev::Screenshot>,
 }
 
@@ -162,57 +109,40 @@ impl FlickerApp {
         let settings = Settings::load();
         let theme = settings.theme;
         theme.apply(&cc.egui_ctx);
+        let engine: Arc<dyn Engine> = Arc::new(FfmpegCli::locate());
         let mut app = Self {
-            engine: Arc::new(FfmpegCli::locate()),
+            player: Player::new(engine.clone()),
+            engine,
             theme,
             write_tags: settings.write_tags,
-            video: None,
-            cut: None,
-            accuracy: Accuracy::Precise,
-            language: "eng".into(),
+            project: Project::default(),
+            view: TimelineView::default(),
+            shown_version: None,
             job: JobRunner::default(),
             dialog: None,
             status: None,
             allow_close: false,
             title: String::new(),
-            last_preview: Instant::now(),
-            resume_after_drag: false,
+            drop: None,
             dev_screenshot: dev::Screenshot::from_env(),
         };
-        for f in files {
-            app.open_any(f);
+        let (projects, media): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().partition(|p| project::is_project(p));
+        if let Some(p) = projects.into_iter().next() {
+            app.open_project(p);
         }
-        if let (Some(cut), Some(v)) = (dev::cut_from_env(), &app.video) {
-            let mut c = Cut::new(v.total(), Duration::ZERO);
-            (c.start, c.end) = cut;
-            app.cut = Some(c);
+        if !media.is_empty() {
+            app.add_files(media, None);
+            app.project = Project::new(app.project.timeline().clone(), None);
         }
-        match dev::dialog_from_env() {
-            Some(dev::Dialog::Volume) => app.dialog = Some(Dialog::Volume(100.0)),
-            Some(dev::Dialog::Fade) => app.dialog = Some(Dialog::Fade { fade_in: 1.0, fade_out: 1.0 }),
-            Some(dev::Dialog::Append(path)) => app.ask_append(path),
-            None => {}
-        }
+        dev::apply(&mut app, &cc.egui_ctx);
         app
     }
 
-    // ---- Opening and showing videos -------------------------------------
-
-    /// Open a dropped or command-line file: a video, or subtitles for the
-    /// current video.
-    fn open_any(&mut self, path: PathBuf) {
-        if SubtitleFormat::from_path(&path).is_some() {
-            self.load_subtitle(path);
-        } else if has_ext(&path, VIDEO_EXTS) {
-            self.request(Pending::Open(path));
-        } else {
-            self.set_status(format!("Can't open {}: not a video or subtitle file.", file_name(&path)), true);
-        }
-    }
+    // ---- Projects ----------------------------------------------------------
 
     /// Do `what`, first asking about unsaved changes if there are any.
     fn request(&mut self, what: Pending) {
-        if self.video.as_ref().is_some_and(|v| v.session.is_dirty()) {
+        if self.project.is_dirty() {
             self.dialog = Some(Dialog::Unsaved(what));
         } else {
             self.proceed(what);
@@ -221,284 +151,216 @@ impl FlickerApp {
 
     fn proceed(&mut self, what: Pending) {
         match what {
-            Pending::Open(path) => self.open_video(path),
+            Pending::Open(path) => self.open_project(path),
+            Pending::New => self.set_project(Project::default()),
             Pending::Quit => self.allow_close = true,
         }
     }
 
-    fn open_video(&mut self, path: PathBuf) {
-        match self.engine.probe(&path) {
-            Ok(info) if info.first_video().is_some() => {
-                let session = Session::new(path);
-                self.video = Some(self.load(session, info, Duration::ZERO));
-                self.cut = None;
-                self.status = None;
+    fn set_project(&mut self, p: Project) {
+        self.project = p;
+        self.view = TimelineView::default();
+        self.player.pause();
+        self.player.seek(Duration::ZERO);
+        self.status = None;
+    }
+
+    fn open_project(&mut self, path: PathBuf) {
+        match project::load(&path) {
+            Ok(t) => {
+                let missing: Vec<String> = t.files().filter(|f| !f.is_file()).map(file_name).collect();
+                self.set_project(Project::new(t, Some(path.clone())));
+                self.view.zoom_fit(self.project.timeline().duration());
+                if missing.is_empty() {
+                    self.set_status(format!("Opened {}", file_name(&path)), false);
+                } else {
+                    self.set_status(format!("Missing: {}", missing.join(", ")), true);
+                }
             }
-            Ok(_) => self.set_status(format!("{} has no video track.", file_name(&path)), true),
             Err(e) => self.set_status(format!("Can't open {}: {e}", file_name(&path)), true),
         }
     }
 
-    fn load(&self, session: Session, info: MediaInfo, seek: Duration) -> Video {
-        let fps = info.first_video().and_then(|v| v.frame_rate);
-        let mut player = Player::new(self.engine.clone(), session.current().to_path_buf(), info.video_length(), fps);
-        player.set_subtitle(session.subtitle().map(Path::to_path_buf));
-        player.seek(seek);
-        Video { session, info, player }
+    fn menu_open(&mut self) {
+        if let Some(p) = pick_file("Flicker project", &[project::EXTENSION]) {
+            self.request(Pending::Open(p));
+        }
     }
 
-    /// Put the session's current step on screen.
-    fn show_current(&mut self, seek: Duration) {
-        let Some(old) = self.video.take() else { return };
-        let show_subs = old.player.show_subtitles();
-        let session = old.session;
-        match self.engine.probe(session.current()) {
-            Ok(info) => {
-                let mut v = self.load(session, info, seek);
-                v.player.set_show_subtitles(show_subs);
-                self.video = Some(v);
+    /// Save the project (asking where if it has no file yet, or `ask`).
+    /// True when saved.
+    fn save_project(&mut self, ask: bool) -> bool {
+        self.project.finish();
+        let path = match (&self.project.path, ask) {
+            (Some(p), false) => p.clone(),
+            _ => match save_project_file(&self.project.suggested_path(project::EXTENSION)) {
+                Some(p) => p,
+                None => return false,
+            },
+        };
+        match project::save(&path, self.project.timeline()) {
+            Ok(()) => {
+                self.project.mark_saved(&path);
+                self.set_status(format!("Saved {}", path.display()), false);
+                true
             }
             Err(e) => {
-                self.set_status(format!("Can't read the edited video: {e}"), true);
-                self.video = Some(old_player_back(session, old.info, old.player));
+                self.fail(format!("Can't save {}: {e}", path.display()));
+                false
             }
         }
-        self.cut = None;
+    }
+
+    // ---- Adding files ------------------------------------------------------
+
+    /// A clip for a file: a video, a picture or sound.
+    fn clip_for(&self, path: &Path) -> Result<Clip, String> {
+        let info = self.engine.probe(path).map_err(|e| e.to_string())?;
+        let audio = info.count(StreamKind::Audio) > 0;
+        if has_ext(path, IMAGE_EXTS) {
+            let mut c = Clip::image(path.to_path_buf());
+            if let Some(v) = info.first_video() {
+                (c.width, c.height) = (v.width, v.height);
+            }
+            return Ok(c);
+        }
+        // Sound files with cover art have a "video" stream too.
+        let video = info.first_video().filter(|_| !has_ext(path, AUDIO_EXTS));
+        match (video, audio) {
+            (Some(v), _) => {
+                let len = info.video_length().ok_or("its length is unknown")?;
+                let mut c = Clip::video(path.to_path_buf(), len, audio);
+                (c.width, c.height, c.fps) = (v.width, v.height, v.frame_rate);
+                Ok(c)
+            }
+            (None, true) => Ok(Clip::audio(path.to_path_buf(), info.duration.ok_or("its length is unknown")?)),
+            (None, false) => Err("it has no picture or sound".into()),
+        }
+    }
+
+    /// Add files to the timeline: at `at` (a track and time, from a drop),
+    /// or videos and pictures at the end of V1 and sound at the playhead.
+    /// Projects open; subtitle files load for the preview.
+    fn add_files(&mut self, files: Vec<PathBuf>, at: Option<(TrackRef, Duration)>) {
+        let mut clips = Vec::new();
+        let mut errors = Vec::new();
+        for f in files {
+            if project::is_project(&f) {
+                self.request(Pending::Open(f));
+            } else if SubtitleFormat::from_path(&f).is_some() {
+                self.load_subtitle(f);
+            } else {
+                match self.clip_for(&f) {
+                    Ok(c) => clips.push(c),
+                    Err(e) => errors.push(format!("Can't add {}: {e}", file_name(&f))),
+                }
+            }
+        }
+        if clips.is_empty() {
+            if let Some(e) = errors.into_iter().next() {
+                self.set_status(e, true);
+            }
+            return;
+        }
+        let was_empty = self.project.timeline().is_empty();
+        let label = match clips.len() {
+            1 => format!("Add {}", clips[0].name()),
+            n => format!("Add {n} Files"),
+        };
+        let playhead = self.player.position();
+        let mut last = None;
+        let mut next_at = at;
+        self.project.edit(&label, |t| {
+            for clip in clips {
+                let placed = place(t, clip, next_at, playhead);
+                if let Some(c) = placed {
+                    // Several files dropped together go one after another.
+                    next_at = next_at.and_then(|(r, _)| t.clip(c).map(|k| (r, k.end())));
+                    last = Some(c);
+                }
+            }
+        });
+        if let Some(c) = last {
+            self.view.selected = Some(c);
+            let t = self.project.timeline();
+            if let Some(k) = t.clip(c) {
+                self.set_status(format!("Added {} to {} at {}", k.name(), c.track.name(), format_timestamp(k.start)), false);
+            }
+        }
+        if was_empty {
+            self.view.zoom_fit(self.project.timeline().duration());
+        }
+        if let Some(e) = errors.into_iter().next() {
+            self.set_status(e, true);
+        }
+    }
+
+    fn menu_add(&mut self) {
+        let files = pick_media();
+        if !files.is_empty() {
+            self.add_files(files, None);
+        }
     }
 
     fn load_subtitle(&mut self, path: PathBuf) {
-        let Some(v) = &mut self.video else {
-            self.set_status("Open a video before loading subtitles.", true);
-            return;
-        };
-        v.session.set_subtitle(Some(path.clone()));
-        v.player.set_subtitle(Some(path.clone()));
-        v.player.set_show_subtitles(true);
-        self.set_status(format!("Showing {} on the video.", file_name(&path)), false);
+        let name = file_name(&path);
+        self.project.edit("Load Subtitles", |t| t.subtitle = Some(path));
+        self.player.set_show_subtitles(true);
+        self.set_status(format!("Showing {name} on the video."), false);
     }
 
-    fn set_status(&mut self, msg: impl Into<String>, error: bool) {
-        self.status = Some((msg.into(), error));
-    }
-
-    // ---- Editing ---------------------------------------------------------
-
-    fn toggle_cut(&mut self) {
-        if self.cut.take().is_none() {
-            if let Some(v) = &self.video {
-                self.cut = Some(Cut::new(v.total(), v.player.position()));
-            }
+    /// Dropped files wait for the pointer to say where they landed.
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        let files = dropped_files(ctx);
+        if !files.is_empty() {
+            self.drop = Some(Drop { files, since: Instant::now() });
         }
-    }
-
-    fn apply_cut(&mut self, ctx: &egui::Context) {
-        let (Some(cut), Some(v)) = (&self.cut, &mut self.video) else { return };
-        if self.job.is_busy() {
-            return;
-        }
-        let total = v.total();
-        let keep = cut.keep(total);
-        let whole = [TimeRange::new(Duration::ZERO, total)];
-        if keep.is_empty() || keep == whole {
-            self.set_status("Move the handles first: this cut wouldn't change anything.", true);
-            return;
-        }
-        let output = match v.session.next_path(&v.session.working_ext()) {
-            Ok(p) => p,
-            Err(e) => return self.set_status(format!("Can't create a working file: {e}"), true),
-        };
-        let subtitle = retime_subtitle(&mut v.session, &keep);
-        let (label, seek_to) = match cut.selection {
-            Selection::Keep => ("Trim", Duration::ZERO),
-            // Land on the join so the result can be checked straight away.
-            Selection::Remove => ("Cut", cut.start.saturating_sub(Duration::from_secs(1))),
-        };
-
-        let mut req = TrimRequest::new(v.session.current().to_path_buf(), output.clone(), keep);
-        req.accuracy = self.accuracy;
-        req.preset = "fast".into();
-        v.player.pause();
-        let engine = self.engine.clone();
-        let job = Job::Edit { label: label.into(), output, subtitle, seek_to };
-        self.job.start(ctx, format!("Applying {}", label.to_lowercase()), job, move |p, c| engine.trim(&req, p, c));
-    }
-
-    fn embed_subtitles(&mut self, ctx: &egui::Context, mode: EmbedMode) {
-        let Some(v) = &mut self.video else { return };
-        if self.job.is_busy() {
-            return;
-        }
-        let subtitle = match v.session.subtitle() {
-            Some(s) => s.to_path_buf(),
-            None => match pick_file("Subtitles", SubtitleFormat::EXTENSIONS) {
-                Some(p) => p,
-                None => return,
-            },
-        };
-        let output = match v.session.next_path(&v.session.working_ext()) {
-            Ok(p) => p,
-            Err(e) => return self.set_status(format!("Can't create a working file: {e}"), true),
-        };
-        let mut req = EmbedRequest::new(v.session.current().to_path_buf(), subtitle.clone(), output.clone());
-        req.mode = mode;
-        req.language = Some(self.language.clone()).filter(|l| !l.is_empty());
-        req.title = subtitle.file_stem().map(|s| s.to_string_lossy().into_owned());
-        req.preset = "fast".into();
-        let (label, keep_overlay) = match mode {
-            EmbedMode::Soft => ("Add subtitles", Some(subtitle)),
-            // Burned in: an overlay on top would show them twice.
-            EmbedMode::Hard => ("Burn subtitles", None),
-        };
-        let seek_to = v.player.position();
-        v.player.pause();
-        let engine = self.engine.clone();
-        let job = Job::Edit { label: label.into(), output, subtitle: keep_overlay, seek_to };
-        self.job.start(ctx, label, job, move |p, c| engine.embed_subtitles(&req, p, c));
-    }
-
-    fn save_as(&mut self, ctx: &egui::Context, then: Option<Pending>) {
-        let Some(v) = &mut self.video else { return };
-        if self.job.is_busy() {
-            return;
-        }
-        let Some(to) = save_file(&v.session.suggested_output()) else { return };
-        let from = v.session.current().to_path_buf();
-        if same_file(&from, &to) {
-            v.session.mark_saved();
-            self.set_status("Already saved there.", false);
-            return;
-        }
-        let mut req = SaveRequest::new(from, to.clone());
-        req.keep_tags = self.write_tags;
-        let label = if req.is_webm() { "Saving as WebM (re-encoding)" } else { "Saving" };
-        v.player.pause();
-        let engine = self.engine.clone();
-        self.job.start(ctx, label, Job::Save { to, then }, move |p, c| engine.save(&req, p, c));
-    }
-
-    // ---- Appending and sound ---------------------------------------------
-
-    fn menu_append(&mut self) {
-        if let Some(p) = pick_media() {
-            self.ask_append(p);
-        }
-    }
-
-    /// Probe the file to append and ask how to join it.
-    fn ask_append(&mut self, path: PathBuf) {
-        if self.video.is_none() {
-            return;
-        }
-        let is_picture = has_ext(&path, IMAGE_EXTS);
-        let clip = if is_picture {
-            Clip::image(path)
+        let Some(d) = &self.drop else { return };
+        let moved = ctx.input(|i| i.raw.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))));
+        if moved || d.since.elapsed() >= DROP_WAIT {
+            let at = if moved { ctx.input(|i| i.pointer.hover_pos()).and_then(|p| self.view.drop_target(p)) } else { None };
+            let files = self.drop.take().map(|d| d.files).unwrap_or_default();
+            self.add_files(files, at);
         } else {
-            match self.engine.probe(&path) {
-                Ok(info) if info.first_video().is_some() => {
-                    let len = info.video_length().unwrap_or_default();
-                    clip_from(path, &info, len)
-                }
-                Ok(_) => return self.set_status(format!("{} has no video track.", file_name(&path)), true),
-                Err(e) => return self.set_status(format!("Can't open {}: {e}", file_name(&path)), true),
-            }
-        };
-        self.dialog = Some(Dialog::Append(AppendForm { clip, is_picture, picture_secs: 4.0, join: Join::Cut, join_secs: 1.0 }));
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
     }
 
-    /// Render the current video followed by `clip` into a new step.
-    fn append(&mut self, ctx: &egui::Context, clip: Clip) {
-        let Some(v) = &mut self.video else { return };
+    // ---- Export --------------------------------------------------------------
+
+    fn export(&mut self, ctx: &egui::Context) {
         if self.job.is_busy() {
             return;
         }
-        let output = match v.session.next_path(&v.session.working_ext()) {
-            Ok(p) => p,
-            Err(e) => return self.set_status(format!("Can't create a working file: {e}"), true),
-        };
-        let timeline = Timeline { clips: vec![v.as_clip(), clip] };
-        // Land a little before the join so it can be checked straight away.
-        let seek_to = timeline.starts()[1].saturating_sub(Duration::from_secs(1));
-        let mut req = ExportRequest::new(timeline, output.clone());
-        req.crf = 18;
-        req.preset = "fast".into();
-        v.player.pause();
-        let subtitle = v.session.subtitle().map(Path::to_path_buf);
-        let engine = self.engine.clone();
-        let job = Job::Edit { label: "Append".into(), output, subtitle, seek_to };
-        self.job.start(ctx, "Appending", job, move |p, c| engine.export_timeline(&req, p, c));
-    }
-
-    fn edit_audio(&mut self, ctx: &egui::Context, edit: AudioEdit) {
-        let Some(v) = &mut self.video else { return };
-        if self.job.is_busy() {
+        if self.project.timeline().is_empty() {
+            self.set_status("Add something to the timeline first.", true);
             return;
         }
-        let output = match v.session.next_path(&v.session.working_ext()) {
-            Ok(p) => p,
-            Err(e) => return self.set_status(format!("Can't create a working file: {e}"), true),
-        };
-        let label = match edit {
-            AudioEdit::Volume(f) => format!("Volume {:.0}%", f * 100.0),
-            AudioEdit::Mute => "Mute".into(),
-            AudioEdit::Fade { .. } => "Fade".into(),
-        };
-        let req = AudioRequest::new(v.session.current().to_path_buf(), output.clone(), edit);
-        let seek_to = v.player.position();
-        v.player.pause();
-        let subtitle = v.session.subtitle().map(Path::to_path_buf);
+        self.project.finish();
+        if let Some(to) = save_file(&self.project.suggested_path("mp4")) {
+            self.export_to(ctx, to);
+        }
+    }
+
+    fn export_to(&mut self, ctx: &egui::Context, to: PathBuf) {
+        if self.project.timeline().files().any(|f| same_file(f, &to)) {
+            self.set_status("Choose another name: that file is used in the timeline.", true);
+            return;
+        }
+        let mut req = ExportRequest::new(self.project.timeline().clone(), to.clone());
+        req.keep_tags = self.write_tags;
+        let label = format!("Exporting {}", file_name(&to));
+        self.player.pause();
         let engine = self.engine.clone();
-        let job = Job::Edit { label: label.clone(), output, subtitle, seek_to };
-        self.job.start(ctx, label, job, move |p, c| engine.edit_audio(&req, p, c));
+        self.job.start(ctx, label, Job::Export { to }, move |p, c| engine.export_timeline(&req, p, c));
     }
 
-    fn undo(&mut self) {
-        if !self.job.is_busy() && self.video.as_mut().is_some_and(|v| v.session.undo()) {
-            self.show_current(Duration::ZERO);
-            self.set_status("Undone.", false);
-        }
-    }
-
-    fn redo(&mut self) {
-        if !self.job.is_busy() && self.video.as_mut().is_some_and(|v| v.session.redo()) {
-            self.show_current(Duration::ZERO);
-            self.set_status("Redone.", false);
-        }
-    }
-
-    fn revert(&mut self) {
-        let Some(v) = &mut self.video else { return };
-        while v.session.undo() {}
-        self.show_current(Duration::ZERO);
-        self.set_status("Back to the original. Redo (Ctrl+Y) brings the edits back.", false);
-    }
-
-    fn poll_job(&mut self, ctx: &egui::Context) {
+    fn poll_job(&mut self) {
         let Some((job, result)) = self.job.poll() else { return };
         match (job, result) {
-            (Job::Edit { label, output, subtitle, seek_to }, Ok(())) => {
-                if let Some(v) = &mut self.video {
-                    v.session.push(Step { path: output, label: label.clone(), subtitle });
-                }
-                self.show_current(seek_to);
-                self.set_status(format!("{label} done. Keep editing, or Undo with Ctrl+Z."), false);
-            }
-            (Job::Edit { output, .. }, Err(e)) => {
-                let _ = std::fs::remove_file(output);
-                self.fail(e);
-            }
-            (Job::Save { to, then }, Ok(())) => {
-                if let Some(v) = &mut self.video {
-                    v.session.mark_saved();
-                }
-                self.set_status(format!("Saved {}", to.display()), false);
-                if let Some(then) = then {
-                    self.proceed(then);
-                    if self.allow_close {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
-            }
-            (Job::Save { .. }, Err(e)) => self.fail(e),
+            (Job::Export { to }, Ok(())) => self.set_status(format!("Exported {}", to.display()), false),
+            (Job::Export { .. }, Err(e)) if e == "cancelled" => self.set_status("Export cancelled.", false),
+            (Job::Export { .. }, Err(e)) => self.fail(e),
         }
     }
 
@@ -507,93 +369,143 @@ impl FlickerApp {
         self.dialog = Some(Dialog::Error(e));
     }
 
-    // ---- Input -----------------------------------------------------------
+    fn set_status(&mut self, msg: impl Into<String>, error: bool) {
+        self.status = Some((msg.into(), error));
+    }
+
+    fn undo(&mut self) {
+        if self.project.undo() {
+            self.view.fix_selection(self.project.timeline());
+            self.set_status("Undone.", false);
+        }
+    }
+
+    fn redo(&mut self) {
+        if self.project.redo() {
+            self.view.fix_selection(self.project.timeline());
+            self.set_status("Redone.", false);
+        }
+    }
+
+    // ---- Input ---------------------------------------------------------------
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if self.dialog.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
         let cmd = |key| KeyboardShortcut::new(Modifiers::COMMAND, key);
+        let cmd_shift = |key| KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, key);
+        let shift = |key| KeyboardShortcut::new(Modifiers::SHIFT, key);
         let plain = |key| KeyboardShortcut::new(Modifiers::NONE, key);
         let pressed = |s: KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(&s));
 
+        // Shifted ones first: a plain shortcut also matches with Shift held.
+        if pressed(cmd_shift(Key::S)) {
+            self.save_project(true);
+        }
+        if pressed(cmd(Key::S)) {
+            self.save_project(false);
+        }
+        if pressed(cmd(Key::N)) {
+            self.request(Pending::New);
+        }
         if pressed(cmd(Key::O)) {
             self.menu_open();
         }
-        if pressed(cmd(Key::S)) {
-            self.save_as(ctx, None);
+        if pressed(cmd(Key::I)) {
+            self.menu_add();
+        }
+        if pressed(cmd(Key::E)) {
+            self.export(ctx);
         }
         if pressed(cmd(Key::Q)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        if pressed(cmd_shift(Key::Z)) || pressed(cmd(Key::Y)) {
+            self.redo();
+        }
         if pressed(cmd(Key::Z)) {
             self.undo();
         }
-        if pressed(cmd(Key::Y)) {
-            self.redo();
+        let at = self.player.position();
+        if pressed(plain(Key::Space)) {
+            self.project.finish();
+            self.player.toggle_play();
         }
-        if self.job.is_busy() {
-            return;
+        if pressed(plain(Key::S)) {
+            self.view.split(&mut self.project, at);
         }
-        if pressed(plain(Key::C)) {
-            self.toggle_cut();
+        if pressed(shift(Key::Delete)) || pressed(shift(Key::Backspace)) {
+            self.view.delete_selected(&mut self.project, true);
         }
-        if pressed(plain(Key::Enter)) {
-            self.apply_cut(ctx);
+        if pressed(plain(Key::Delete)) || pressed(plain(Key::Backspace)) {
+            self.view.delete_selected(&mut self.project, false);
         }
         if pressed(plain(Key::Escape)) {
-            self.cut = None;
+            self.view.selected = None;
         }
-        let Some(v) = &mut self.video else { return };
-        if pressed(plain(Key::Space)) {
-            v.player.toggle_play();
+        if pressed(plain(Key::Plus)) || pressed(plain(Key::Equals)) || pressed(shift(Key::Equals)) {
+            self.view.zoom_in(at);
+        }
+        if pressed(plain(Key::Minus)) {
+            self.view.zoom_out(at);
         }
         let five = Duration::from_secs(5);
+        let frame = self.player.frame_len();
+        if pressed(shift(Key::ArrowLeft)) {
+            self.player.seek(at.saturating_sub(five));
+        }
+        if pressed(shift(Key::ArrowRight)) {
+            self.player.seek(at + five);
+        }
         if pressed(plain(Key::ArrowLeft)) {
-            v.player.seek(v.player.position().saturating_sub(five));
+            self.player.pause();
+            self.player.seek(at.saturating_sub(frame));
         }
         if pressed(plain(Key::ArrowRight)) {
-            v.player.seek(v.player.position() + five);
+            self.player.pause();
+            self.player.seek(at + frame);
         }
-        if let Some(cut) = &mut self.cut {
-            let at = v.player.position();
-            if pressed(plain(Key::I)) {
-                cut.set(timeline::Handle::Start, at);
-            }
-            if pressed(plain(Key::O)) {
-                cut.set(timeline::Handle::End, at);
-            }
+        if pressed(plain(Key::Home)) {
+            self.player.seek(Duration::ZERO);
+        }
+        if pressed(plain(Key::End)) {
+            self.player.seek(self.player.duration().saturating_sub(frame));
         }
     }
 
-    fn menu_open(&mut self) {
-        if let Some(p) = pick_file("Video", VIDEO_EXTS) {
-            self.request(Pending::Open(p));
-        }
-    }
-
-    // ---- Layout ----------------------------------------------------------
+    // ---- Layout ----------------------------------------------------------------
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let has_video = self.video.is_some();
         let busy = self.job.is_busy();
+        let has_clips = !self.project.timeline().is_empty();
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if item(ui, true, "Open…", "Ctrl+O") {
+                if item(ui, true, "New Project", "Ctrl+N") {
+                    self.request(Pending::New);
+                }
+                if item(ui, true, "Open Project…", "Ctrl+O") {
                     self.menu_open();
                 }
-                if item(ui, has_video && !busy, "Save As…", "Ctrl+S") {
-                    self.save_as(&ctx, None);
+                if item(ui, true, "Save Project", "Ctrl+S") {
+                    self.save_project(false);
                 }
-                let edited = self.video.as_ref().is_some_and(|v| v.session.undo_label().is_some());
-                if item(ui, edited && !busy, "Revert to Original", "") {
-                    self.revert();
+                if item(ui, true, "Save Project As…", "Ctrl+Shift+S") {
+                    self.save_project(true);
+                }
+                ui.separator();
+                if item(ui, true, "Add to Timeline…", "Ctrl+I") {
+                    self.menu_add();
+                }
+                ui.separator();
+                if item(ui, has_clips && !busy, "Export Video…", "Ctrl+E") {
+                    self.export(&ctx);
                 }
                 ui.separator();
                 ui.menu_button("Preferences", |ui| {
                     let mut tags = self.write_tags;
-                    if check_item(ui, &mut tags, "Write encoder name and dates into saved files") {
+                    if check_item(ui, &mut tags, "Write encoder name and dates into exported files") {
                         self.write_tags = tags;
                         Settings::update(|s| s.write_tags = tags);
                     }
@@ -605,105 +517,76 @@ impl FlickerApp {
             });
 
             ui.menu_button("Edit", |ui| {
-                let (undo, redo) = match &self.video {
-                    Some(v) => (v.session.undo_label().map(str::to_owned), v.session.redo_label().map(str::to_owned)),
-                    None => (None, None),
-                };
-                let text = |verb: &str, what: &Option<String>| match what {
+                let text = |verb: &str, what: Option<&str>| match what {
                     Some(w) => format!("{verb} {w}"),
                     None => verb.to_owned(),
                 };
-                if item(ui, undo.is_some() && !busy, &text("Undo", &undo), "Ctrl+Z") {
+                let (undo, redo) = (self.project.undo_label().map(str::to_owned), self.project.redo_label().map(str::to_owned));
+                if item(ui, undo.is_some(), &text("Undo", undo.as_deref()), "Ctrl+Z") {
                     self.undo();
                 }
-                if item(ui, redo.is_some() && !busy, &text("Redo", &redo), "Ctrl+Y") {
+                if item(ui, redo.is_some(), &text("Redo", redo.as_deref()), "Ctrl+Y") {
                     self.redo();
                 }
                 ui.separator();
-                if item(ui, has_video && !busy, "Append Video or Picture…", "") {
-                    self.menu_append();
+                let sel = self.view.selected.is_some();
+                let at = self.player.position();
+                if item(ui, has_clips, "Split at Playhead", "S") {
+                    self.view.split(&mut self.project, at);
                 }
-            });
-
-            ui.menu_button("Cut", |ui| {
-                let cutting = self.cut.is_some();
-                let label = if cutting { "Leave Cut Mode" } else { "Cut Mode" };
-                if item(ui, has_video && !busy, label, "C") {
-                    self.toggle_cut();
+                if item(ui, sel, "Delete", "Del") {
+                    self.view.delete_selected(&mut self.project, false);
                 }
-                ui.separator();
-                if let Some(cut) = &mut self.cut {
-                    ui.radio_value(&mut cut.selection, Selection::Keep, "Keep between handles");
-                    ui.radio_value(&mut cut.selection, Selection::Remove, "Remove between handles");
-                    ui.separator();
-                }
-                let at = self.video.as_ref().map(|v| v.player.position());
-                if item(ui, cutting, "Start Handle to Playhead", "I") {
-                    if let (Some(c), Some(t)) = (&mut self.cut, at) {
-                        c.set(timeline::Handle::Start, t);
-                    }
-                }
-                if item(ui, cutting, "End Handle to Playhead", "O") {
-                    if let (Some(c), Some(t)) = (&mut self.cut, at) {
-                        c.set(timeline::Handle::End, t);
-                    }
+                if item(ui, sel, "Ripple Delete", "Shift+Del") {
+                    self.view.delete_selected(&mut self.project, true);
                 }
                 ui.separator();
-                if item(ui, cutting && !busy, "Apply", "Enter") {
-                    self.apply_cut(&ctx);
+                if item(ui, true, "Add Video Track", "") {
+                    self.project.edit("Add Video Track", |t| t.add_track(TrackKind::Video));
                 }
-                if item(ui, cutting, "Cancel", "Esc") {
-                    self.cut = None;
-                }
-                ui.separator();
-                ui.menu_button("Accuracy", |ui| {
-                    ui.radio_value(&mut self.accuracy, Accuracy::Precise, "Precise: exact frame, re-encodes");
-                    ui.radio_value(&mut self.accuracy, Accuracy::Fast, "Fast: lossless, snaps to keyframes");
-                });
-            });
-
-            ui.menu_button("Audio", |ui| {
-                let sound = self.video.as_ref().is_some_and(Video::has_audio) && !busy;
-                if item(ui, sound, "Volume…", "") {
-                    self.dialog = Some(Dialog::Volume(100.0));
-                }
-                if item(ui, sound, "Mute", "") {
-                    self.edit_audio(&ctx, AudioEdit::Mute);
-                }
-                if item(ui, sound, "Fade In/Out…", "") {
-                    self.dialog = Some(Dialog::Fade { fade_in: 1.0, fade_out: 1.0 });
+                if item(ui, true, "Add Audio Track", "") {
+                    self.project.edit("Add Audio Track", |t| t.add_track(TrackKind::Audio));
                 }
             });
 
             ui.menu_button("Subtitles", |ui| {
-                if item(ui, has_video, "Load for Preview…", "") {
+                if item(ui, true, "Load…", "") {
                     if let Some(p) = pick_file("Subtitles", SubtitleFormat::EXTENSIONS) {
                         self.load_subtitle(p);
                     }
                 }
-                if let Some(v) = &mut self.video {
-                    if v.player.has_subtitle() {
-                        let mut show = v.player.show_subtitles();
-                        if check_item(ui, &mut show, "Show on Video") {
-                            v.player.set_show_subtitles(show);
-                        }
-                        if ui.button("Unload").clicked() {
-                            v.session.set_subtitle(None);
-                            v.player.set_subtitle(None);
-                        }
+                let loaded = self.project.timeline().subtitle.is_some();
+                if loaded {
+                    let mut show = self.player.show_subtitles();
+                    if check_item(ui, &mut show, "Show on Video") {
+                        self.player.set_show_subtitles(show);
+                    }
+                    if ui.button("Unload").clicked() {
+                        self.project.edit("Unload Subtitles", |t| t.subtitle = None);
                     }
                 }
                 ui.separator();
-                if item(ui, has_video && !busy, "Add as Track", "") {
-                    self.embed_subtitles(&ctx, EmbedMode::Soft);
-                }
-                if item(ui, has_video && !busy, "Burn into Picture", "") {
-                    self.embed_subtitles(&ctx, EmbedMode::Hard);
-                }
-                ui.menu_button("Track Language", |ui| {
-                    for (code, name) in LANGUAGES {
-                        ui.radio_value(&mut self.language, (*code).to_owned(), *name);
-                    }
+                ui.add_enabled_ui(loaded, |ui| {
+                    ui.menu_button("When Exporting", |ui| {
+                        let mut mode = self.project.timeline().subtitle_export;
+                        let old = mode;
+                        ui.radio_value(&mut mode, SubtitleExport::Off, "Leave Out");
+                        ui.radio_value(&mut mode, SubtitleExport::Track, "Add as Track (viewers can turn it off)");
+                        ui.radio_value(&mut mode, SubtitleExport::Burn, "Burn into Picture");
+                        if mode != old {
+                            self.project.edit("Subtitle Export", |t| t.subtitle_export = mode);
+                        }
+                    });
+                    ui.menu_button("Track Language", |ui| {
+                        let mut lang = self.project.timeline().subtitle_language.clone();
+                        let old = lang.clone();
+                        for (code, name) in LANGUAGES {
+                            ui.radio_value(&mut lang, (*code).to_owned(), *name);
+                        }
+                        if lang != old {
+                            self.project.edit("Subtitle Language", |t| t.subtitle_language = lang);
+                        }
+                    });
                 });
             });
 
@@ -717,6 +600,17 @@ impl FlickerApp {
                         }
                     }
                 });
+                ui.separator();
+                let at = self.player.position();
+                if item(ui, true, "Zoom In", "+") {
+                    self.view.zoom_in(at);
+                }
+                if item(ui, true, "Zoom Out", "-") {
+                    self.view.zoom_out(at);
+                }
+                if item(ui, true, "Zoom to Fit", "") {
+                    self.view.zoom_fit(self.project.timeline().duration());
+                }
             });
 
             ui.menu_button("Help", |ui| {
@@ -727,74 +621,39 @@ impl FlickerApp {
                     self.dialog = Some(Dialog::About);
                 }
             });
-
-            // While cutting, the cut's summary and its two actions sit right
-            // in the bar.
-            if let (Some(cut), Some(v)) = (&self.cut, &self.video) {
-                ui.separator();
-                let result: Duration = cut.keep(v.total()).iter().map(TimeRange::len).sum();
-                let verb = match cut.selection {
-                    Selection::Keep => "Keep",
-                    Selection::Remove => "Remove",
-                };
-                ui.label(format!(
-                    "{verb} {} – {}  →  {}",
-                    format_timestamp(cut.start),
-                    format_timestamp(cut.end),
-                    format_timestamp(result)
-                ));
-                let theme = self.theme;
-                let button = |ui: &mut egui::Ui, enabled: bool, text: &str| {
-                    let resp = ui.add_enabled(enabled, egui::Button::new(text).min_size(egui::vec2(72.0, 20.0)));
-                    theme.bevel(ui.painter(), resp.rect, resp.is_pointer_button_down_on());
-                    resp.clicked()
-                };
-                if button(ui, !busy, "✔ Apply") {
-                    self.apply_cut(&ctx);
-                }
-                if button(ui, true, "✖ Cancel") {
-                    self.cut = None;
-                }
-            }
         });
     }
 
     fn transport(&mut self, ui: &mut egui::Ui) {
-        let theme = self.theme;
-        let Some(v) = &mut self.video else { return };
-        let total = v.total();
-        let busy = self.job.is_busy();
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            let icon = if v.player.is_playing() { "⏸" } else { "▶" };
-            let play = ui.add_enabled(!busy, egui::Button::new(RichText::new(icon).size(15.0)).min_size(egui::vec2(34.0, 26.0)));
-            if play.on_hover_text("Play / pause (Space)").clicked() {
-                v.player.toggle_play();
+            let theme = self.theme;
+            let has = !self.player.duration().is_zero();
+            let button = |ui: &mut egui::Ui, icon: Icon, tip: &str| {
+                let resp = ui.add_enabled(has, egui::Button::new("").min_size(egui::vec2(32.0, 24.0)));
+                theme.bevel(ui.painter(), resp.rect, resp.is_pointer_button_down_on());
+                let ink = if has { ui.visuals().text_color() } else { ui.visuals().weak_text_color() };
+                draw_icon(ui.painter(), resp.rect.center(), icon, ink);
+                resp.on_hover_text(tip).clicked()
+            };
+            if button(ui, Icon::Start, "Start (Home)") {
+                self.player.seek(Duration::ZERO);
             }
-            ui.monospace(format!("{} / {}", format_timestamp(v.player.position()), format_timestamp(total)));
-            ui.add_space(4.0);
-            ui.add_enabled_ui(!busy, |ui| {
-                let out = timeline::show(ui, theme, total, v.player.position(), self.cut.as_mut());
-                let dragging_handle = self.cut.as_ref().is_some_and(|c| c.dragging().is_some());
-                if dragging_handle && v.player.is_playing() {
-                    self.resume_after_drag = true;
-                    v.player.pause();
-                }
-                if let Some(t) = out.preview {
-                    if self.last_preview.elapsed() >= PREVIEW_EVERY {
-                        self.last_preview = Instant::now();
-                        v.player.seek(t);
-                    } else {
-                        ui.ctx().request_repaint_after(PREVIEW_EVERY);
-                    }
-                }
-                if let Some(t) = out.seek {
-                    v.player.seek(t);
-                    if std::mem::take(&mut self.resume_after_drag) {
-                        v.player.toggle_play();
-                    }
-                }
-            });
+            let icon = if self.player.is_playing() { Icon::Pause } else { Icon::Play };
+            if button(ui, icon, "Play / pause (Space)") {
+                self.project.finish();
+                self.player.toggle_play();
+            }
+            if button(ui, Icon::End, "End (End)") {
+                let end = self.player.duration().saturating_sub(self.player.frame_len());
+                self.player.seek(end);
+            }
+            ui.add_space(6.0);
+            ui.monospace(format!("{} / {}", format_timestamp(self.player.position()), format_timestamp(self.player.duration())));
+            if let Some(note) = self.player.sound_note() {
+                ui.add_space(8.0);
+                ui.label(RichText::new(format!("🔇 {note}")).color(ui.visuals().warn_fg_color));
+            }
         });
         ui.add_space(2.0);
     }
@@ -804,47 +663,40 @@ impl FlickerApp {
         ui.horizontal(|ui| {
             let job_running = self.job.progress_ui(ui);
             if !job_running {
-                let (text, error) = match (&self.status, &self.video) {
+                let (text, error) = match (&self.status, self.player.error()) {
                     (Some((t, e)), _) => (t.clone(), *e),
-                    (None, Some(_)) if self.cut.is_some() => {
-                        ("Drag the handles. Space plays the result in a loop. Enter applies.".into(), false)
+                    (None, Some(e)) => (format!("Preview: {}", last_line(e)), true),
+                    (None, None) if self.project.timeline().is_empty() => {
+                        ("Add videos, pictures and music with File > Add to Timeline, or drop them on the timeline.".into(), false)
                     }
-                    (None, Some(_)) => ("Ready".into(), false),
-                    (None, None) => ("Open a video with File > Open, or drop one on the window.".into(), false),
+                    (None, None) => ("Ready".into(), false),
                 };
                 let color = if error { ui.visuals().error_fg_color } else { ui.visuals().text_color() };
-                sunken_label(ui, theme, RichText::new(text).color(color), ui.available_width() - 260.0);
+                sunken_label(ui, theme, RichText::new(text).color(color), ui.available_width() - 290.0);
             }
-            if let Some(v) = &self.video {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let dirty = if v.session.is_dirty() { " (edited)" } else { "" };
-                    sunken_label(ui, theme, RichText::new(format!("{}{dirty}", v.info.summary())).small(), 250.0);
-                });
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let t = self.project.timeline();
+                let c = t.suggested_canvas();
+                let edited = if self.project.is_dirty() { " (edited)" } else { "" };
+                let summary = format!(
+                    "{}x{} · {:.0} fps · {} · {} clips{edited}",
+                    c.width,
+                    c.height,
+                    c.fps,
+                    format_duration(t.duration()),
+                    t.clip_count()
+                );
+                sunken_label(ui, theme, RichText::new(summary).small(), 280.0);
+            });
         });
     }
 
     fn video_area(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
-        match &mut self.video {
-            Some(v) => {
-                let inner = rect.shrink(2.0);
-                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
-                v.player.ui(&mut child);
-                ui.advance_cursor_after_rect(rect);
-            }
-            None => {
-                ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "File > Open…  or drop a video here",
-                    egui::FontId::proportional(16.0),
-                    Color32::GRAY,
-                );
-                ui.advance_cursor_after_rect(rect);
-            }
-        }
+        let inner = rect.shrink(2.0);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+        self.player.ui(&mut child);
+        ui.advance_cursor_after_rect(rect);
         self.theme.bevel(ui.painter(), rect, true);
     }
 
@@ -853,17 +705,15 @@ impl FlickerApp {
         let theme = self.theme;
         let mut close = false;
         let mut then: Option<Result<Pending, Pending>> = None; // Ok = discard & go, Err = save first
-        let mut action: Option<DialogAction> = None;
-        let total = self.video.as_ref().map(Video::total).unwrap_or_default();
         match &mut dialog {
             Dialog::Unsaved(what) => {
-                let name = self.video.as_ref().map(Video::name).unwrap_or_default();
+                let name = self.project.name();
                 window(ctx, theme, "Flicker", |ui| {
-                    ui.label(format!("The edits to {name} haven't been saved."));
-                    ui.label("Save them as a new file first?");
+                    ui.label(format!("The changes to {name} haven't been saved."));
+                    ui.label("Save the project first?");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Save As…").clicked() {
+                        if ui.button("Save").clicked() {
                             then = Some(Err(what.clone()));
                         }
                         if ui.button("Don't Save").clicked() {
@@ -884,8 +734,10 @@ impl FlickerApp {
                             ui.end_row();
                         }
                     });
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Drag clips to move them, drag their edges to trim, right-click for more.").small());
                     ui.add_space(8.0);
-                    close = ui.button("OK").clicked();
+                    close = ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
                 });
             }
             Dialog::About => {
@@ -909,132 +761,70 @@ impl FlickerApp {
                     close = ui.button("OK").clicked();
                 });
             }
-            Dialog::Append(form) => {
-                window(ctx, theme, "Append Video or Picture", |ui| {
-                    let what = if form.is_picture { "picture" } else { "video" };
-                    ui.label(format!("Add the {what} {} to the end.", form.clip.name()));
-                    ui.add_space(6.0);
-                    egui::Grid::new("append").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                        if form.is_picture {
-                            ui.label("Show the picture for:");
-                            seconds(ui, &mut form.picture_secs, 0.5..=600.0);
-                            ui.end_row();
-                        }
-                        ui.label("Join with:");
-                        ui.horizontal(|ui| {
-                            ui.radio_value(&mut form.join, Join::Cut, "Cut");
-                            ui.radio_value(&mut form.join, Join::Crossfade, "Cross-fade");
-                            ui.radio_value(&mut form.join, Join::DipToBlack, "Dip to black");
-                        });
-                        ui.end_row();
-                        ui.label("Transition length:");
-                        ui.add_enabled_ui(form.join != Join::Cut, |ui| seconds(ui, &mut form.join_secs, 0.1..=10.0));
-                        ui.end_row();
-                    });
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("A different size is fitted with black bars.").small().weak());
-                    ui.add_space(8.0);
-                    match ok_cancel(ui) {
-                        Some(true) => {
-                            let mut clip = form.clip.clone();
-                            if form.is_picture {
-                                clip.set_range(Duration::ZERO, Duration::from_secs_f32(form.picture_secs));
-                            }
-                            let kind = match form.join {
-                                Join::Cut => None,
-                                Join::Crossfade => Some(TransitionKind::Crossfade),
-                                Join::DipToBlack => Some(TransitionKind::DipToBlack),
-                            };
-                            if let Some(kind) = kind {
-                                clip.transition = Transition { kind, duration: Duration::from_secs_f32(form.join_secs) };
-                            }
-                            action = Some(DialogAction::Append(clip));
-                        }
-                        Some(false) => close = true,
-                        None => {}
-                    }
-                });
-            }
-            Dialog::Volume(percent) => {
-                window(ctx, theme, "Volume", |ui| {
-                    ui.label("Change the volume of the whole video.");
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().slider_width = 220.0;
-                        ui.add(egui::Slider::new(percent, 0.0..=200.0).step_by(5.0).fixed_decimals(0).suffix("%"));
-                    });
-                    ui.add_space(8.0);
-                    match ok_cancel(ui) {
-                        Some(true) => action = Some(DialogAction::Audio(AudioEdit::Volume(*percent / 100.0))),
-                        Some(false) => close = true,
-                        None => {}
-                    }
-                });
-            }
-            Dialog::Fade { fade_in, fade_out } => {
-                let max = (total.as_secs_f32() / 2.0).max(0.1);
-                window(ctx, theme, "Fade In/Out", |ui| {
-                    ui.label("Fade the sound in at the start and out at the end.");
-                    ui.add_space(6.0);
-                    egui::Grid::new("fade").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                        ui.label("Fade in:");
-                        seconds(ui, fade_in, 0.0..=max);
-                        ui.end_row();
-                        ui.label("Fade out:");
-                        seconds(ui, fade_out, 0.0..=max);
-                        ui.end_row();
-                    });
-                    ui.add_space(8.0);
-                    match ok_cancel(ui) {
-                        Some(true) => {
-                            action = Some(DialogAction::Audio(AudioEdit::Fade {
-                                fade_in: Duration::from_secs_f32(*fade_in),
-                                fade_out: Duration::from_secs_f32(*fade_out),
-                            }))
-                        }
-                        Some(false) => close = true,
-                        None => {}
-                    }
-                });
-            }
         }
-        if !close && then.is_none() && action.is_none() {
+        if !close && then.is_none() {
             self.dialog = Some(dialog);
-        }
-        match action {
-            Some(DialogAction::Append(clip)) => self.append(ctx, clip),
-            Some(DialogAction::Audio(edit)) => self.edit_audio(ctx, edit),
-            None => {}
         }
         match then {
             Some(Ok(what)) => {
-                if let Some(v) = &mut self.video {
-                    v.session.mark_saved(); // discarding: nothing left to ask about
-                }
                 self.proceed(what);
                 if self.allow_close {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
-            Some(Err(what)) => {
-                self.save_as(ctx, Some(what));
+            // Save first; carry on only if it was saved.
+            Some(Err(what)) if self.save_project(false) => {
+                self.proceed(what);
+                if self.allow_close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
-            None => {}
+            Some(Err(_)) | None => {}
         }
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let title = match &self.video {
-            Some(v) => {
-                let star = if v.session.is_dirty() { " *" } else { "" };
-                format!("{} - {}{star}", crate::APP_NAME, v.name())
-            }
-            None => crate::APP_NAME.to_owned(),
-        };
+        let star = if self.project.is_dirty() { " *" } else { "" };
+        let title = format!("{} - {}{star}", crate::APP_NAME, self.project.name());
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
         }
+    }
+
+    /// Hand the player the timeline as it is now.
+    fn sync_player(&mut self) {
+        if self.shown_version != Some(self.project.version()) {
+            self.shown_version = Some(self.project.version());
+            self.player.set_timeline(Arc::new(self.project.timeline().clone()));
+        }
+    }
+}
+
+/// Where a new clip goes (see [`FlickerApp::add_files`]).
+fn place(t: &mut Timeline, clip: Clip, at: Option<(TrackRef, Duration)>, playhead: Duration) -> Option<ClipRef> {
+    match at {
+        Some((r, time)) => {
+            let target = if t.track(r).is_some_and(|tr| tr.accepts(&clip)) {
+                r
+            } else if clip.kind == ClipKind::Audio {
+                TrackRef::A1
+            } else {
+                TrackRef::V1
+            };
+            t.add_clip(target, clip, time)
+        }
+        None if clip.kind == ClipKind::Audio => {
+            // The first audio track with room at the playhead, or a new one.
+            let len = clip.len();
+            let free = (0..t.audio.len()).find(|&i| t.audio[i].is_free(playhead, playhead + len, None));
+            let r = match free {
+                Some(i) => TrackRef::audio(i),
+                None => t.add_track(TrackKind::Audio),
+            };
+            t.add_clip(r, clip, playhead)
+        }
+        None => t.append(TrackRef::V1, clip),
     }
 }
 
@@ -1044,14 +834,14 @@ impl eframe::App for FlickerApp {
         if let Some(shot) = &mut self.dev_screenshot {
             shot.tick(&ctx);
         }
-        self.poll_job(&ctx);
+        self.poll_job();
         if self.job.is_busy() {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 
-        // Closing with unsaved edits asks first (the working files are temporary).
+        // Closing with unsaved changes asks first.
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
-            if self.video.as_ref().is_some_and(|v| v.session.is_dirty()) {
+            if self.project.is_dirty() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.dialog = Some(Dialog::Unsaved(Pending::Quit));
             } else {
@@ -1059,31 +849,71 @@ impl eframe::App for FlickerApp {
             }
         }
 
-        if !self.job.is_busy() {
-            for path in dropped_files(&ctx) {
-                self.open_any(path);
-            }
-        }
+        self.handle_drops(&ctx);
         self.shortcuts(&ctx);
-        if let Some(v) = &mut self.video {
-            let total = v.total();
-            v.player.set_play_ranges(self.cut.as_ref().map(|c| c.keep(total)));
-        }
         self.update_title(&ctx);
 
         let theme = self.theme;
-        egui::Panel::top("menu").show(ui, |ui| {
-            self.menu_bar(ui);
-        });
+        let face = if theme.is_win95() { theme::FACE } else { ui.visuals().panel_fill };
+        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        if self.video.is_some() {
-            egui::Panel::bottom("transport").show(ui, |ui| self.transport(ui));
+        egui::Panel::bottom("timeline")
+            .resizable(true)
+            .default_size(270.0)
+            .size_range(150.0..=700.0)
+            .frame(egui::Frame::NONE.fill(face).inner_margin(4))
+            .show(ui, |ui| {
+                self.view.toolbar(ui, theme, &mut self.project, &mut self.player);
+                ui.add_space(2.0);
+                self.view.tracks(ui, theme, &mut self.project, &mut self.player);
+            });
+        egui::Panel::bottom("transport").show(ui, |ui| self.transport(ui));
+
+        // A drag or slider has ended once nothing is held or being typed in.
+        if self.project.in_gesture() && !ctx.input(|i| i.pointer.any_down()) && ctx.memory(|m| m.focused().is_none()) {
+            self.project.finish();
         }
+        self.sync_player();
+
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(if theme.is_win95() { theme::FACE } else { ui.visuals().panel_fill }).inner_margin(4))
+            .frame(egui::Frame::NONE.fill(face).inner_margin(4))
             .show(ui, |ui| self.video_area(ui));
 
         self.dialogs(&ctx);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Start,
+    Play,
+    Pause,
+    End,
+}
+
+/// Transport icons, drawn so they look the same in every theme and font.
+fn draw_icon(p: &egui::Painter, c: egui::Pos2, icon: Icon, ink: Color32) {
+    let tri = |dir: f32, x: f32| {
+        let pts = vec![egui::pos2(x - 4.0 * dir, c.y - 6.0), egui::pos2(x + 4.0 * dir, c.y), egui::pos2(x - 4.0 * dir, c.y + 6.0)];
+        egui::Shape::convex_polygon(pts, ink, egui::Stroke::NONE)
+    };
+    let bar = |x: f32| egui::Rect::from_center_size(egui::pos2(x, c.y), egui::vec2(2.5, 12.0));
+    match icon {
+        Icon::Play => {
+            p.add(tri(1.0, c.x + 1.0));
+        }
+        Icon::Pause => {
+            p.rect_filled(bar(c.x - 3.0), 0.0, ink);
+            p.rect_filled(bar(c.x + 3.0), 0.0, ink);
+        }
+        Icon::Start => {
+            p.rect_filled(bar(c.x - 5.0), 0.0, ink);
+            p.add(tri(-1.0, c.x + 1.5));
+        }
+        Icon::End => {
+            p.add(tri(1.0, c.x - 1.5));
+            p.rect_filled(bar(c.x + 5.0), 0.0, ink);
+        }
     }
 }
 
@@ -1111,34 +941,6 @@ fn check_item(ui: &mut egui::Ui, on: &mut bool, text: &str) -> bool {
         *on = !*on;
     }
     clicked
-}
-
-/// A seconds field for dialogs.
-fn seconds(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
-    ui.add(egui::DragValue::new(value).range(range).speed(0.1).max_decimals(1).suffix(" s"));
-}
-
-/// OK / Cancel at the bottom of a dialog. `Some(true)` for OK (or Enter),
-/// `Some(false)` for Cancel (or Esc).
-fn ok_cancel(ui: &mut egui::Ui) -> Option<bool> {
-    let mut answer = None;
-    ui.horizontal(|ui| {
-        if ui.add(egui::Button::new("OK").min_size(egui::vec2(72.0, 0.0))).clicked() {
-            answer = Some(true);
-        }
-        if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 0.0))).clicked() {
-            answer = Some(false);
-        }
-    });
-    // Fields above have already taken a value typed before Enter.
-    if answer.is_none() {
-        if ui.input(|i| i.key_pressed(Key::Enter)) {
-            answer = Some(true);
-        } else if ui.input(|i| i.key_pressed(Key::Escape)) {
-            answer = Some(false);
-        }
-    }
-    answer
 }
 
 /// A sunken status-bar field.
@@ -1187,57 +989,59 @@ fn file_name(p: &Path) -> String {
     p.file_name().unwrap_or(p.as_os_str()).to_string_lossy().into_owned()
 }
 
-/// Keep showing the previous video when the new step can't be read.
-fn old_player_back(session: Session, info: MediaInfo, player: Player) -> Video {
-    Video { session, info, player }
-}
-
-/// Retime the preview subtitles to match an edit keeping `keep`, writing the
-/// result next to the step files. `None` if there are none or they can't be read.
-fn retime_subtitle(session: &mut Session, keep: &[TimeRange]) -> Option<PathBuf> {
-    let src = session.subtitle()?.to_path_buf();
-    let text = std::fs::read_to_string(&src).ok()?;
-    let (out_text, ext) = match SubtitleFormat::from_path(&src)? {
-        SubtitleFormat::Ass => (flicker_core::retime::retime_ass(&text, keep), "ass"),
-        SubtitleFormat::Srt => (flicker_core::retime::retime_srt(&text, keep), "srt"),
-        SubtitleFormat::WebVtt => return None,
-    };
-    let path = session.next_path(ext).ok()?;
-    std::fs::write(&path, out_text).ok()?;
-    Some(path)
-}
-
 /// Developer aids for checking the UI without a screen grabber:
-/// `FLICKER_SCREENSHOT=out.ppm FLICKER_SCREENSHOT_AFTER=2.5 flicker …`
-/// saves the window after the given number of seconds. Add `FLICKER_AUTOPLAY=1`
-/// to start playing, and `FLICKER_CUT=2,4` to open cut mode with the handles
-/// at 2s and 4s. `FLICKER_DIALOG=volume|fade|append=<file>` opens a dialog.
+/// `FLICKER_SCREENSHOT=out.ppm FLICKER_SCREENSHOT_AFTER=2.5 flicker …` saves
+/// the window after the given number of seconds. `FLICKER_AUTOPLAY=1`
+/// starts playing, `FLICKER_SEEK=3.5` moves the playhead,
+/// `FLICKER_SELECT=V1:2` selects a clip, `FLICKER_ZOOM=60` sets pixels per
+/// second, `FLICKER_DIALOG=shortcuts|about|unsaved` opens a dialog and
+/// `FLICKER_EXPORT=out.mp4` starts exporting there.
 mod dev {
     use std::time::{Duration, Instant};
 
     use eframe::egui;
+    use flicker_core::{ClipRef, TrackRef};
 
-    pub enum Dialog {
-        Volume,
-        Fade,
-        Append(std::path::PathBuf),
+    use super::{Dialog, FlickerApp, Pending};
+
+    fn var(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|s| !s.is_empty())
     }
 
-    /// `FLICKER_DIALOG=volume`, `fade` or `append=<file>` opens that dialog.
-    pub fn dialog_from_env() -> Option<Dialog> {
-        let s = std::env::var("FLICKER_DIALOG").ok()?;
-        match s.split_once('=') {
-            Some(("append", path)) => Some(Dialog::Append(path.into())),
-            _ if s == "volume" => Some(Dialog::Volume),
-            _ if s == "fade" => Some(Dialog::Fade),
-            _ => None,
+    pub fn apply(app: &mut FlickerApp, ctx: &egui::Context) {
+        if let Some(out) = var("FLICKER_EXPORT") {
+            app.export_to(ctx, out.into());
+        }
+        if let Some(z) = var("FLICKER_ZOOM").and_then(|z| z.parse().ok()) {
+            app.view.zoom = z;
+        }
+        if let Some(sel) = var("FLICKER_SELECT") {
+            app.view.selected = parse_clip(&sel);
+        }
+        app.sync_player();
+        if let Some(t) = var("FLICKER_SEEK").and_then(|s| s.parse::<f64>().ok()) {
+            app.player.seek(Duration::from_secs_f64(t));
+        }
+        if var("FLICKER_AUTOPLAY").is_some() {
+            app.player.toggle_play();
+        }
+        match var("FLICKER_DIALOG").as_deref() {
+            Some("shortcuts") => app.dialog = Some(Dialog::Shortcuts),
+            Some("about") => app.dialog = Some(Dialog::About),
+            Some("unsaved") => app.dialog = Some(Dialog::Unsaved(Pending::Quit)),
+            _ => {}
         }
     }
 
-    pub fn cut_from_env() -> Option<(Duration, Duration)> {
-        let s = std::env::var("FLICKER_CUT").ok()?;
-        let (a, b) = s.split_once(',')?;
-        Some((Duration::from_secs_f64(a.trim().parse().ok()?), Duration::from_secs_f64(b.trim().parse().ok()?)))
+    /// "V1:2" = the third clip on V1.
+    fn parse_clip(s: &str) -> Option<ClipRef> {
+        let (track, index) = s.split_once(':')?;
+        let n: usize = track.get(1..)?.parse().ok()?;
+        let track = match track.chars().next()? {
+            'V' | 'v' => TrackRef::video(n.checked_sub(1)?),
+            _ => TrackRef::audio(n.checked_sub(1)?),
+        };
+        Some(ClipRef { track, index: index.parse().ok()? })
     }
 
     pub struct Screenshot {
@@ -1248,11 +1052,8 @@ mod dev {
 
     impl Screenshot {
         pub fn from_env() -> Option<Self> {
-            let path = std::env::var("FLICKER_SCREENSHOT").ok()?;
-            let after = std::env::var("FLICKER_SCREENSHOT_AFTER")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(2.0);
+            let path = var("FLICKER_SCREENSHOT")?;
+            let after = var("FLICKER_SCREENSHOT_AFTER").and_then(|s| s.parse::<f64>().ok()).unwrap_or(2.0);
             Some(Self { path, at: Instant::now() + Duration::from_secs_f64(after), requested: false })
         }
 
@@ -1267,14 +1068,12 @@ mod dev {
             }
             self.requested = true;
             let path = self.path.clone();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(
-                move |img| {
-                    let [w, h] = img.size;
-                    let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-                    out.extend(img.pixels.iter().flat_map(|c| [c.r(), c.g(), c.b()]));
-                    let _ = std::fs::write(&path, out);
-                },
-            )));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {
+                let [w, h] = img.size;
+                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                out.extend(img.pixels.iter().flat_map(|c| [c.r(), c.g(), c.b()]));
+                let _ = std::fs::write(&path, out);
+            })));
         }
     }
 }

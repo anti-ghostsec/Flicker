@@ -9,10 +9,10 @@ use flicker_core::{CancelToken, Progress};
 use eframe::egui;
 
 pub const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "m4v", "webm", "avi", "ts", "flv", "wmv"];
-/// Pictures Edit > Append takes.
-pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "gif", "tif", "tiff"];
-/// Save As choices: (filter name, extension). MP4/MKV/MOV copy the streams;
-/// WebM re-encodes to VP9 + Opus.
+pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff"];
+pub const AUDIO_EXTS: &[&str] = &["mp3", "wav", "flac", "ogg", "oga", "opus", "m4a", "aac", "wma"];
+/// Export choices: (filter name, extension). WebM is VP9 + Opus, the
+/// others H.264 + AAC.
 pub const OUTPUT_FORMATS: &[(&str, &str)] = &[
     ("MP4 video (H.264 + AAC)", "mp4"),
     ("WebM video (VP9 + Opus)", "webm"),
@@ -118,7 +118,9 @@ impl<T> JobRunner<T> {
         if ui.button("Cancel").clicked() {
             job.cancel.cancel();
         }
-        ui.add(egui::ProgressBar::new(fraction.unwrap_or(0.0)).text(text).desired_width(260.0));
+        // The text beside the bar, where it stays readable at any fill.
+        ui.add(egui::ProgressBar::new(fraction.unwrap_or(0.0)).desired_width(160.0));
+        ui.label(text);
         true
     }
 }
@@ -128,16 +130,32 @@ pub fn pick_file(kind: &str, exts: &[&str]) -> Option<PathBuf> {
     rfd::FileDialog::new().add_filter(kind, exts).add_filter("All files", &["*"]).pick_file()
 }
 
-/// Picker for Edit > Append: videos and pictures.
+/// Picker for File > Add to Timeline: videos, pictures and sound, several at once.
 #[cfg(not(target_os = "android"))]
-pub fn pick_media() -> Option<PathBuf> {
-    let all: Vec<&str> = VIDEO_EXTS.iter().chain(IMAGE_EXTS).copied().collect();
+pub fn pick_media() -> Vec<PathBuf> {
+    let all: Vec<&str> = VIDEO_EXTS.iter().chain(IMAGE_EXTS).chain(AUDIO_EXTS).copied().collect();
     rfd::FileDialog::new()
-        .add_filter("Videos and pictures", &all)
+        .add_filter("Videos, pictures and sound", &all)
         .add_filter("Videos", VIDEO_EXTS)
         .add_filter("Pictures", IMAGE_EXTS)
+        .add_filter("Sound", AUDIO_EXTS)
         .add_filter("All files", &["*"])
-        .pick_file()
+        .pick_files()
+        .unwrap_or_default()
+}
+
+/// Save dialog for a project file.
+#[cfg(not(target_os = "android"))]
+pub fn save_project_file(suggested: &Path) -> Option<PathBuf> {
+    let mut dlg = rfd::FileDialog::new().add_filter("Flicker project", &[flicker_core::project::EXTENSION]);
+    if let Some(dir) = suggested.parent().filter(|d| d.is_dir()) {
+        dlg = dlg.set_directory(dir);
+    }
+    if let Some(name) = suggested.file_name() {
+        dlg = dlg.set_file_name(name.to_string_lossy());
+    }
+    let path = dlg.save_file()?;
+    Some(if path.extension().is_none() { path.with_extension(flicker_core::project::EXTENSION) } else { path })
 }
 
 /// "Save as" dialog starting at `suggested`. A name typed without an
@@ -169,7 +187,12 @@ pub fn pick_file(_kind: &str, _exts: &[&str]) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "android")]
-pub fn pick_media() -> Option<PathBuf> {
+pub fn pick_media() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(target_os = "android")]
+pub fn save_project_file(_suggested: &Path) -> Option<PathBuf> {
     None
 }
 

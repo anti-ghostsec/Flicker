@@ -4,11 +4,11 @@ use std::time::Duration;
 use crate::edit::TrimRequest;
 use crate::job::{CancelToken, Progress};
 use crate::media::MediaInfo;
-use crate::preview::{FrameSource, PreviewRequest};
+use crate::preview::{FrameSource, PcmSource, PreviewRequest, TimelinePreview};
 use crate::audio::AudioRequest;
 use crate::privacy::SaveRequest;
 use crate::subtitles::EmbedRequest;
-use crate::timeline::ExportRequest;
+use crate::render::ExportRequest;
 use crate::Result;
 
 /// A media backend. Implementations must be usable from a worker thread.
@@ -48,7 +48,7 @@ pub trait Engine: Send + Sync {
         cancel: &CancelToken,
     ) -> Result<()>;
 
-    /// Render clips one after another (with transitions) into one file.
+    /// Render the whole timeline into one file.
     fn export_timeline(
         &self,
         req: &ExportRequest,
@@ -67,4 +67,12 @@ pub trait Engine: Send + Sync {
 
     /// Start decoding frames for on-screen preview.
     fn open_preview(&self, req: &PreviewRequest) -> Result<Box<dyn FrameSource>>;
+
+    /// Decode the timeline's picture from `req.start` on, for the live
+    /// preview (or just one frame, for scrubbing).
+    fn open_timeline_frames(&self, req: &TimelinePreview) -> Result<Box<dyn FrameSource>>;
+
+    /// Mix the timeline's sound from `req.start` on, as 48 kHz stereo
+    /// 16-bit PCM.
+    fn open_timeline_sound(&self, req: &TimelinePreview) -> Result<Box<dyn PcmSource>>;
 }

@@ -13,11 +13,12 @@ use crate::edit::{self, TrimRequest};
 use crate::engine::Engine;
 use crate::job::{CancelToken, Progress};
 use crate::media::{parse_timestamp, MediaInfo, StreamInfo, StreamKind};
-use crate::preview::{self, Frame, FrameSource, PreviewRequest};
+use crate::preview::{self, Frame, FrameSource, PcmSource, PreviewRequest, TimelinePreview};
 use crate::audio::{self, AudioRequest};
 use crate::privacy::{self, SaveRequest};
 use crate::subtitles::{ffmpeg_args, EmbedRequest};
-use crate::timeline::{self, ExportRequest};
+use crate::render::{self, ExportRequest, PreviewOpts};
+use crate::timeline::Timeline;
 use crate::{Error, Result};
 
 /// How many trailing stderr lines to keep for error messages.
@@ -195,8 +196,21 @@ impl Engine for FfmpegCli {
         cancel: &CancelToken,
     ) -> Result<()> {
         req.validate()?;
-        let args = timeline::export_args(req);
-        self.run_job(&args, Some(req.timeline.duration()), &req.output, on_progress, cancel)
+        // Render next to the output, then write the file privately from
+        // there (a copy pass, like every save: encoders insist on naming
+        // themselves in stream tags).
+        let staging = privacy::staging_path(&req.output);
+        let mut render_req = req.clone();
+        render_req.output = staging.clone();
+        let args = render::export_args(&render_req);
+        let result = (|| {
+            self.run_job(&args, Some(req.timeline.duration()), &staging, on_progress, cancel)?;
+            let info = self.probe(&staging)?;
+            let args = privacy::scrub_args(&staging, &req.output, &info, req.keep_tags);
+            self.run_job(&args, None, &req.output, &mut |_| {}, cancel)
+        })();
+        let _ = std::fs::remove_file(&staging);
+        result
     }
 
     fn save(
@@ -254,6 +268,185 @@ impl Engine for FfmpegCli {
             frame_time: 1.0 / req.fps,
             decoded: 0,
         }))
+    }
+
+    fn open_timeline_frames(&self, req: &TimelinePreview) -> Result<Box<dyn FrameSource>> {
+        let total = req.timeline.duration();
+        let (canvas, subtitles, single_frame) = (req.canvas, req.subtitles, req.single_frame);
+        let opts = move |from, to| PreviewOpts { canvas, from, to, subtitles, single_frame };
+        if req.single_frame {
+            // Past the end shows the last frame.
+            let frame = Duration::from_secs_f64(1.0 / req.canvas.normalized().fps);
+            let from = req.start.min(total.saturating_sub(frame));
+            return Ok(Box::new(self.spawn_frames(&req.timeline, &opts(from, from + frame * 2))?));
+        }
+        let (engine, timeline) = (self.clone(), req.timeline.clone());
+        let mk = move |from, to| engine.spawn_frames(&timeline, &opts(from, to));
+        Ok(Box::new(Chain::new(preview::stretches(req.start, total), Box::new(mk))))
+    }
+
+    fn open_timeline_sound(&self, req: &TimelinePreview) -> Result<Box<dyn PcmSource>> {
+        let total = req.timeline.duration();
+        let canvas = req.canvas;
+        let (engine, timeline) = (self.clone(), req.timeline.clone());
+        let mk = move |from, to| {
+            let args = render::preview_audio_args(&timeline, &PreviewOpts { canvas, from, to, subtitles: false, single_frame: false });
+            let (child, stdout, log) = engine.spawn_pipe(&args)?;
+            Ok(FfmpegPcm { bytes: 0, child, stdout, log: Some(log) })
+        };
+        Ok(Box::new(Chain::new(preview::stretches(req.start, total), Box::new(mk))))
+    }
+}
+
+impl FfmpegCli {
+    /// Start ffmpeg with its output on a pipe and its log collected on a thread.
+    fn spawn_pipe(&self, args: &[std::ffi::OsString]) -> Result<(Child, ChildStdout, JoinHandle<String>)> {
+        let mut child = command(&self.ffmpeg)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| spawn_error(&self.ffmpeg, e))?;
+        let stderr = child.stderr.take().expect("stderr piped");
+        let stdout = child.stdout.take().expect("stdout piped");
+        Ok((child, stdout, thread::spawn(move || tail_lines(stderr, LOG_TAIL))))
+    }
+
+    fn spawn_frames(&self, timeline: &Timeline, opts: &PreviewOpts) -> Result<FfmpegFrames> {
+        let args = render::preview_video_args(timeline, opts);
+        let (child, stdout, log) = self.spawn_pipe(&args)?;
+        Ok(FfmpegFrames {
+            child,
+            stdout: BufReader::with_capacity(1 << 20, stdout),
+            log: Some(log),
+            start: opts.from,
+            frame_time: 1.0 / opts.canvas.normalized().fps,
+            decoded: 0,
+        })
+    }
+}
+
+type Spawn<S> = Box<dyn Fn(Duration, Duration) -> Result<S> + Send>;
+
+/// Start the next stretch's ffmpeg this long before the current one ends,
+/// so it's ready in time without both sitting in memory for long.
+const LEAD: Duration = Duration::from_millis(1500);
+
+/// Stretches of the timeline played one after another.
+struct Chain<S> {
+    stretches: VecDeque<(Duration, Duration)>,
+    spawn: Spawn<S>,
+    cur: Option<S>,
+    /// The current stretch.
+    span: (Duration, Duration),
+    /// The next stretch, started ahead of time.
+    next: Option<((Duration, Duration), Result<S>)>,
+}
+
+impl<S> Chain<S> {
+    fn new(stretches: Vec<(Duration, Duration)>, spawn: Spawn<S>) -> Self {
+        Self { stretches: stretches.into(), spawn, cur: None, span: Default::default(), next: None }
+    }
+
+    /// Move on to the next stretch. False at the end.
+    fn advance(&mut self) -> Result<bool> {
+        self.cur = None;
+        let (span, s) = match self.next.take() {
+            Some(n) => n,
+            None => match self.stretches.pop_front() {
+                Some((a, b)) => ((a, b), (self.spawn)(a, b)),
+                None => return Ok(false),
+            },
+        };
+        self.span = span;
+        self.cur = Some(s?);
+        Ok(true)
+    }
+
+    /// Playback has got to `pos`: start the next stretch if it's close.
+    fn reached(&mut self, pos: Duration) {
+        if self.next.is_none() && pos + LEAD >= self.span.1 {
+            if let Some((a, b)) = self.stretches.pop_front() {
+                self.next = Some(((a, b), (self.spawn)(a, b)));
+            }
+        }
+    }
+}
+
+impl FrameSource for Chain<FfmpegFrames> {
+    fn next_frame(&mut self) -> Result<Option<Frame>> {
+        loop {
+            if self.cur.is_none() && !self.advance()? {
+                return Ok(None);
+            }
+            match self.cur.as_mut().map(|c| c.next_frame()).transpose()?.flatten() {
+                Some(f) => {
+                    self.reached(f.pts);
+                    return Ok(Some(f));
+                }
+                None => self.cur = None,
+            }
+        }
+    }
+}
+
+impl PcmSource for Chain<FfmpegPcm> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        loop {
+            if self.cur.is_none() && !self.advance()? {
+                return Ok(0);
+            }
+            match self.cur.as_mut().map(|c| c.read(buf)).transpose()?.unwrap_or(0) {
+                0 => self.cur = None,
+                n => {
+                    let read = self.cur.as_ref().map_or(0, |c| c.bytes);
+                    let at = self.span.0 + Duration::from_secs_f64(read as f64 / (render::SAMPLE_RATE as f64 * 4.0));
+                    self.reached(at);
+                    return Ok(n);
+                }
+            }
+        }
+    }
+}
+
+/// Raw PCM read from an ffmpeg process.
+struct FfmpegPcm {
+    /// Bytes read so far.
+    bytes: u64,
+    child: Child,
+    stdout: ChildStdout,
+    log: Option<JoinHandle<String>>,
+}
+
+impl PcmSource for FfmpegPcm {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let want = buf.len() / 4 * 4;
+        let mut n = self.stdout.read(&mut buf[..want])?;
+        if n == 0 {
+            let status = self.child.wait()?;
+            let log = self.log.take().and_then(|h| h.join().ok()).unwrap_or_default();
+            return if status.success() { Ok(0) } else { Err(Error::Ffmpeg { code: status.code(), log }) };
+        }
+        // Whole sample frames only.
+        while n % 4 != 0 {
+            match self.stdout.read(&mut buf[n..want])? {
+                0 => {
+                    n -= n % 4;
+                    break;
+                }
+                m => n += m,
+            }
+        }
+        self.bytes += n as u64;
+        Ok(n)
+    }
+}
+
+impl Drop for FfmpegPcm {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

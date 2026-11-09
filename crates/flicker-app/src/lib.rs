@@ -4,8 +4,9 @@
 mod app;
 mod common;
 pub mod player;
-mod session;
+mod project;
 mod settings;
+mod sound;
 mod theme;
 mod timeline;
 
@@ -15,14 +16,15 @@ pub const APP_NAME: &str = "Flicker";
 
 #[cfg(not(target_os = "android"))]
 pub fn run_desktop() -> eframe::Result {
-    // `flicker video.mp4 [subs.srt]` (also how "Open with…" passes files).
+    // `flicker project.flicker`, or `flicker video.mp4 music.mp3 [subs.srt]`
+    // (also how "Open with…" passes files).
     let files: Vec<std::path::PathBuf> =
         std::env::args_os().skip(1).map(std::path::PathBuf::from).filter(|p| p.is_file()).collect();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(APP_NAME)
-            .with_inner_size([960.0, 640.0])
-            .with_min_inner_size([520.0, 360.0])
+            .with_inner_size([1024.0, 720.0])
+            .with_min_inner_size([640.0, 480.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };

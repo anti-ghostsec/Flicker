@@ -14,6 +14,8 @@ pub mod job;
 pub mod media;
 pub mod preview;
 pub mod privacy;
+pub mod project;
+pub mod render;
 pub mod retime;
 pub mod subtitles;
 pub mod timeline;
@@ -25,7 +27,10 @@ pub use error::{Error, Result};
 pub use ffmpeg::FfmpegCli;
 pub use job::{CancelToken, Progress};
 pub use media::{MediaInfo, StreamInfo, StreamKind};
-pub use preview::{Frame, FrameSource, PreviewRequest};
+pub use preview::{Frame, FrameSource, PcmSource, PreviewRequest, TimelinePreview};
 pub use privacy::SaveRequest;
 pub use subtitles::{EmbedMode, EmbedRequest, SubtitleFormat};
-pub use timeline::{Canvas, Clip, ClipKind, ExportFormat, ExportRequest, Timeline, Transition, TransitionKind};
+pub use render::{ExportFormat, ExportRequest, SAMPLE_RATE};
+pub use timeline::{
+    Canvas, Clip, ClipKind, ClipRef, Edge, SubtitleExport, Timeline, Track, TrackKind, TrackRef, TransitionKind,
+};

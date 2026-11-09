@@ -23,6 +23,9 @@ pub enum Error {
     #[error("ffmpeg failed (exit code {code:?}):\n{log}")]
     Ffmpeg { code: Option<i32>, log: String },
 
+    #[error("can't read the project: {0}")]
+    Project(String),
+
     #[error("cancelled")]
     Cancelled,
 
