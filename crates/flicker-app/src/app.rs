@@ -9,6 +9,8 @@ use flicker_core::{
     Timeline, TrackKind, TrackRef,
 };
 
+use zeroize::Zeroizing;
+
 use crate::common::{
     dropped_files, has_ext, pick_file, pick_media, save_file, save_project_file, JobRunner, AUDIO_EXTS, IMAGE_EXTS,
 };
@@ -72,9 +74,38 @@ enum Pending {
 
 enum Dialog {
     Unsaved(Pending),
+    Password(PasswordDialog),
     Shortcuts,
     About,
     Error(String),
+}
+
+/// What a password dialog is for.
+enum PasswordFor {
+    /// Choose one, then save to `path` (and carry on with `then`).
+    Save { path: PathBuf, then: Option<Pending> },
+    /// File > Change Project Password.
+    Change,
+    /// Unlock the project at `path`.
+    Open { path: PathBuf },
+}
+
+struct PasswordDialog {
+    what: PasswordFor,
+    first: Zeroizing<String>,
+    second: Zeroizing<String>,
+    /// "Wrong password", shown under the field.
+    error: Option<String>,
+    focus: bool,
+}
+
+impl PasswordDialog {
+    fn new(what: PasswordFor) -> Self {
+        // Room enough that typing never moves the text (which would leave
+        // a copy behind in freed memory).
+        let field = || Zeroizing::new(String::with_capacity(256));
+        Self { what, first: field(), second: field(), error: None, focus: true }
+    }
 }
 
 /// Files dropped from the file manager, waiting for the pointer position.
@@ -101,6 +132,8 @@ pub struct FlickerApp {
     allow_close: bool,
     title: String,
     drop: Option<Drop>,
+    /// Close the window on the next frame (after quitting was agreed to).
+    close_now: bool,
     dev_screenshot: Option<dev::Screenshot>,
 }
 
@@ -124,6 +157,7 @@ impl FlickerApp {
             allow_close: false,
             title: String::new(),
             drop: None,
+            close_now: false,
             dev_screenshot: dev::Screenshot::from_env(),
         };
         let (projects, media): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().partition(|p| project::is_project(p));
@@ -153,12 +187,17 @@ impl FlickerApp {
         match what {
             Pending::Open(path) => self.open_project(path),
             Pending::New => self.set_project(Project::default()),
-            Pending::Quit => self.allow_close = true,
+            Pending::Quit => {
+                self.allow_close = true;
+                self.close_now = true;
+            }
         }
     }
 
     fn set_project(&mut self, p: Project) {
         self.project = p;
+        // A new project starts at version 0 again: the player must catch up.
+        self.shown_version = None;
         self.view = TimelineView::default();
         self.player.pause();
         self.player.seek(Duration::ZERO);
@@ -166,18 +205,32 @@ impl FlickerApp {
     }
 
     fn open_project(&mut self, path: PathBuf) {
-        match project::load(&path) {
-            Ok(t) => {
-                let missing: Vec<String> = t.files().filter(|f| !f.is_file()).map(file_name).collect();
-                self.set_project(Project::new(t, Some(path.clone())));
-                self.view.zoom_fit(self.project.timeline().duration());
-                if missing.is_empty() {
-                    self.set_status(format!("Opened {}", file_name(&path)), false);
-                } else {
-                    self.set_status(format!("Missing: {}", missing.join(", ")), true);
-                }
+        match project::load(&path, None) {
+            Ok(o) => self.opened(path, o, None),
+            Err(flicker_core::Error::PasswordNeeded) => {
+                self.dialog = Some(Dialog::Password(PasswordDialog::new(PasswordFor::Open { path })));
             }
             Err(e) => self.set_status(format!("Can't open {}: {e}", file_name(&path)), true),
+        }
+    }
+
+    /// Show a project just opened (with the password that unlocked it).
+    fn opened(&mut self, path: PathBuf, o: project::Opened, password: Option<Zeroizing<String>>) {
+        let missing: Vec<String> = o.timeline.files().filter(|f| !f.is_file()).map(file_name).collect();
+        let mut p = Project::new(o.timeline, Some(path.clone()));
+        p.password = password;
+        p.was_plain = o.was_plain;
+        self.set_project(p);
+        self.view.zoom_fit(self.project.timeline().duration());
+        if !missing.is_empty() {
+            self.set_status(format!("Missing: {}", missing.join(", ")), true);
+        } else if o.was_plain {
+            self.set_status(
+                format!("Opened {}. It isn't encrypted yet: it will be when you save it.", file_name(&path)),
+                false,
+            );
+        } else {
+            self.set_status(format!("Opened {}", file_name(&path)), false);
         }
     }
 
@@ -187,9 +240,10 @@ impl FlickerApp {
         }
     }
 
-    /// Save the project (asking where if it has no file yet, or `ask`).
-    /// True when saved.
-    fn save_project(&mut self, ask: bool) -> bool {
+    /// Save the project (asking where if it has no file yet, or `ask`),
+    /// then do `then`. The first save asks for a password. True when saved
+    /// right away.
+    fn save_project(&mut self, ask: bool, then: Option<Pending>) -> bool {
         self.project.finish();
         let path = match (&self.project.path, ask) {
             (Some(p), false) => p.clone(),
@@ -198,10 +252,24 @@ impl FlickerApp {
                 None => return false,
             },
         };
-        match project::save(&path, self.project.timeline()) {
+        if self.project.password.is_none() {
+            self.dialog = Some(Dialog::Password(PasswordDialog::new(PasswordFor::Save { path, then })));
+            return false;
+        }
+        self.write_project(&path, then)
+    }
+
+    /// Write the project, encrypted with its password, then do `then`.
+    fn write_project(&mut self, path: &Path, then: Option<Pending>) -> bool {
+        let Some(password) = &self.project.password else { return false };
+        match project::save(path, self.project.timeline(), password) {
             Ok(()) => {
-                self.project.mark_saved(&path);
-                self.set_status(format!("Saved {}", path.display()), false);
+                let note = if self.project.was_plain { " (now encrypted)" } else { "" };
+                self.project.mark_saved(path);
+                self.set_status(format!("Saved {}{note}", file_name(path)), false);
+                if let Some(what) = then {
+                    self.proceed(what);
+                }
                 true
             }
             Err(e) => {
@@ -209,6 +277,11 @@ impl FlickerApp {
                 false
             }
         }
+    }
+
+    fn change_password(&mut self) {
+        self.project.finish();
+        self.dialog = Some(Dialog::Password(PasswordDialog::new(PasswordFor::Change)));
     }
 
     // ---- Adding files ------------------------------------------------------
@@ -409,10 +482,10 @@ impl FlickerApp {
 
         // Shifted ones first: a plain shortcut also matches with Shift held.
         if pressed(cmd_shift(Key::S)) {
-            self.save_project(true);
+            self.save_project(true, None);
         }
         if pressed(cmd(Key::S)) {
-            self.save_project(false);
+            self.save_project(false, None);
         }
         if pressed(cmd(Key::N)) {
             self.request(Pending::New);
@@ -497,10 +570,13 @@ impl FlickerApp {
                     self.menu_open();
                 }
                 if item(ui, true, "Save Project", "Ctrl+S") {
-                    self.save_project(false);
+                    self.save_project(false, None);
                 }
                 if item(ui, true, "Save Project As…", "Ctrl+Shift+S") {
-                    self.save_project(true);
+                    self.save_project(true, None);
+                }
+                if item(ui, true, "Change Project Password…", "") {
+                    self.change_password();
                 }
                 ui.separator();
                 if item(ui, true, "Add to Timeline…", "Ctrl+I") {
@@ -716,9 +792,15 @@ impl FlickerApp {
         match &mut dialog {
             Dialog::Unsaved(what) => {
                 let name = self.project.name();
+                let plain = self.project.was_plain && !self.project.has_changes();
                 window(ctx, theme, "Flicker", |ui| {
-                    ui.label(format!("The changes to {name} haven't been saved."));
-                    ui.label("Save the project first?");
+                    if plain {
+                        ui.label(format!("{name} is saved without encryption."));
+                        ui.label("Save it encrypted first?");
+                    } else {
+                        ui.label(format!("The changes to {name} haven't been saved."));
+                        ui.label("Save the project first?");
+                    }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
@@ -732,6 +814,20 @@ impl FlickerApp {
                         }
                     });
                 });
+            }
+            Dialog::Password(d) => {
+                let name = match &d.what {
+                    PasswordFor::Open { path } | PasswordFor::Save { path, .. } => file_name(path),
+                    PasswordFor::Change => self.project.name(),
+                };
+                let mut ok = false;
+                window(ctx, theme, password_title(&d.what), |ui| password_ui(ui, d, &name, &mut ok, &mut close));
+                if ok {
+                    close = self.password_ok(d);
+                }
+                if close {
+                    forget_password_fields(ctx);
+                }
             }
             Dialog::Shortcuts => {
                 window(ctx, theme, "Keyboard Shortcuts", |ui| {
@@ -774,20 +870,56 @@ impl FlickerApp {
             self.dialog = Some(dialog);
         }
         match then {
-            Some(Ok(what)) => {
-                self.proceed(what);
-                if self.allow_close {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            Some(Ok(what)) => self.proceed(what),
+            // Save first; carry on only once it's saved (which may take a
+            // password first).
+            Some(Err(what)) => {
+                self.save_project(false, Some(what));
+            }
+            None => {}
+        }
+    }
+
+    /// OK in a password dialog. True when it's done with.
+    fn password_ok(&mut self, d: &mut PasswordDialog) -> bool {
+        match &mut d.what {
+            PasswordFor::Open { path } => {
+                let path = path.clone();
+                match project::load(&path, Some(&d.first)) {
+                    Ok(o) => {
+                        self.opened(path, o, Some(std::mem::take(&mut d.first)));
+                        true
+                    }
+                    Err(flicker_core::Error::WrongPassword) => {
+                        d.error = Some("Wrong password. Try again.".into());
+                        d.first.clear();
+                        d.focus = true;
+                        false
+                    }
+                    Err(e) => {
+                        self.set_status(format!("Can't open {}: {e}", file_name(&path)), true);
+                        true
+                    }
                 }
             }
-            // Save first; carry on only if it was saved.
-            Some(Err(what)) if self.save_project(false) => {
-                self.proceed(what);
-                if self.allow_close {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+            PasswordFor::Save { path, then } => {
+                let (path, then) = (path.clone(), then.take());
+                self.project.password = Some(std::mem::take(&mut d.first));
+                self.write_project(&path, then);
+                true
             }
-            Some(Err(_)) | None => {}
+            PasswordFor::Change => {
+                self.project.password = Some(std::mem::take(&mut d.first));
+                match self.project.path.clone() {
+                    Some(path) => {
+                        if self.write_project(&path, None) {
+                            self.set_status(format!("Password changed. Saved {} with it.", file_name(&path)), false);
+                        }
+                    }
+                    None => self.set_status("Password set. It's used when you save the project.", false),
+                }
+                true
+            }
         }
     }
 
@@ -847,6 +979,9 @@ impl eframe::App for FlickerApp {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 
+        if std::mem::take(&mut self.close_now) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // Closing with unsaved changes asks first.
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             if self.project.is_dirty() {
@@ -888,11 +1023,16 @@ impl eframe::App for FlickerApp {
             .show(ui, |ui| self.video_area(ui));
 
         self.dialogs(&ctx);
+        if self.close_now {
+            ctx.request_repaint();
+        }
     }
 
     fn on_exit(&mut self) {
         // An export still running is stopped, and its unfinished file deleted.
         self.job.cancel_and_wait(Duration::from_secs(5));
+        // Wiped on drop.
+        self.project.password = None;
     }
 }
 
@@ -991,6 +1131,94 @@ fn window(ctx: &egui::Context, theme: Theme, title: &str, body: impl FnOnce(&mut
     });
 }
 
+fn password_title(what: &PasswordFor) -> &'static str {
+    match what {
+        PasswordFor::Open { .. } => "Enter Password",
+        PasswordFor::Save { .. } => "Set Project Password",
+        PasswordFor::Change => "Change Project Password",
+    }
+}
+
+/// The fields' ids, so their state (which egui keeps for undo) can be
+/// dropped when the dialog closes.
+const PASSWORD_FIELDS: [&str; 2] = ["password-1", "password-2"];
+
+fn forget_password_fields(ctx: &egui::Context) {
+    for f in PASSWORD_FIELDS {
+        ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(egui::Id::unique(f)));
+    }
+}
+
+/// A password dialog's body. Sets `ok` or `cancel` when clicked.
+fn password_ui(ui: &mut egui::Ui, d: &mut PasswordDialog, name: &str, ok: &mut bool, cancel: &mut bool) {
+    let field = |ui: &mut egui::Ui, text: &mut String, id: &str, focus: bool| {
+        let r = ui.add(
+            egui::TextEdit::singleline(text).id(egui::Id::unique(id)).password(true).desired_width(200.0),
+        );
+        if focus {
+            r.request_focus();
+        }
+        r
+    };
+    let choosing = !matches!(d.what, PasswordFor::Open { .. });
+    let focus = std::mem::take(&mut d.focus);
+    if choosing {
+        ui.label(match d.what {
+            PasswordFor::Change => format!("Choose a new password for {name}."),
+            _ => format!("Flicker encrypts project files. Choose a password for {name}."),
+        });
+    } else {
+        ui.label(format!("{name} is locked with a password."));
+    }
+    ui.add_space(8.0);
+    egui::Grid::new("password-grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+        ui.label("Password:");
+        field(ui, &mut d.first, PASSWORD_FIELDS[0], focus);
+        ui.end_row();
+        if choosing {
+            ui.label("Type it again:");
+            field(ui, &mut d.second, PASSWORD_FIELDS[1], false);
+            ui.end_row();
+        }
+    });
+    let mut can = !d.first.is_empty();
+    if choosing {
+        ui.add_space(4.0);
+        let warn = ui.visuals().warn_fg_color;
+        if !d.second.is_empty() && *d.second != *d.first {
+            ui.label(RichText::new("The passwords don't match.").color(ui.visuals().error_fg_color));
+        } else if !d.first.is_empty() && d.first.chars().count() < project::SHORT_PASSWORD {
+            ui.label(RichText::new(format!(
+                "That's short: {} or more characters are much harder to guess.",
+                project::SHORT_PASSWORD
+            ))
+            .color(warn));
+        }
+        ui.add_space(4.0);
+        ui.label("If you forget it, the project can't be opened: there's no way to recover it.");
+        can &= *d.second == *d.first;
+    } else if let Some(e) = &d.error {
+        ui.add_space(4.0);
+        ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+    }
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.add_enabled(can, egui::Button::new("OK").min_size(egui::vec2(72.0, 0.0))).clicked() {
+            *ok = true;
+        }
+        if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(72.0, 0.0))).clicked() {
+            *cancel = true;
+        }
+    });
+    let (enter, esc) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+    if enter && can {
+        *ok = true;
+    }
+    if esc {
+        *cancel = true;
+    }
+}
+
 fn same_file(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -1007,7 +1235,7 @@ fn file_name(p: &Path) -> String {
 /// the window after the given number of seconds. `FLICKER_AUTOPLAY=1`
 /// starts playing, `FLICKER_SEEK=3.5` moves the playhead,
 /// `FLICKER_SELECT=V1:2` selects a clip, `FLICKER_ZOOM=60` sets pixels per
-/// second, `FLICKER_DIALOG=shortcuts|about|unsaved` opens a dialog and
+/// second, `FLICKER_DIALOG=shortcuts|about|unsaved|password|change-password` opens a dialog and
 /// `FLICKER_EXPORT=out.mp4` starts exporting there.
 mod dev {
     use std::time::{Duration, Instant};
@@ -1015,7 +1243,7 @@ mod dev {
     use eframe::egui;
     use flicker_core::{ClipRef, TrackRef};
 
-    use super::{Dialog, FlickerApp, Pending};
+    use super::{Dialog, FlickerApp, PasswordDialog, PasswordFor, Pending};
 
     fn var(name: &str) -> Option<String> {
         std::env::var(name).ok().filter(|s| !s.is_empty())
@@ -1042,6 +1270,11 @@ mod dev {
             Some("shortcuts") => app.dialog = Some(Dialog::Shortcuts),
             Some("about") => app.dialog = Some(Dialog::About),
             Some("unsaved") => app.dialog = Some(Dialog::Unsaved(Pending::Quit)),
+            Some("change-password") => app.change_password(),
+            Some("password") => {
+                let path = app.project.suggested_path(flicker_core::project::EXTENSION);
+                app.dialog = Some(Dialog::Password(PasswordDialog::new(PasswordFor::Save { path, then: None })));
+            }
             _ => {}
         }
     }

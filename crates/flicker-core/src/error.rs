@@ -26,6 +26,12 @@ pub enum Error {
     #[error("can't read the project: {0}")]
     Project(String),
 
+    #[error("this project is locked with a password")]
+    PasswordNeeded,
+
+    #[error("wrong password (or the project file is damaged)")]
+    WrongPassword,
+
     #[error("cancelled")]
     Cancelled,
 

@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 flicker-core = { path = "../flicker-core" }
 eframe = "0.37"
+# The project password is wiped from memory when it's no longer needed.
+zeroize = "1"
 
 # Native file dialogs exist on desktop only; Android will use the system picker.
 [target.'cfg(not(target_os = "android"))'.dependencies]

@@ -26,7 +26,8 @@ Flicker is one window: the player at the top, the timeline under it, and a menu 
 
 ### Projects
 
-- **File > New Project** (`Ctrl+N`), **Open Project…** (`Ctrl+O`), **Save Project** (`Ctrl+S`) and **Save Project As…** (`Ctrl+Shift+S`). A project is a small `.flicker` file (JSON) that points at your files; nothing is copied. Files moved into the project's folder are found there.
+- **File > New Project** (`Ctrl+N`), **Open Project…** (`Ctrl+O`), **Save Project** (`Ctrl+S`) and **Save Project As…** (`Ctrl+Shift+S`). A project is a small `.flicker` file that points at your files; nothing is copied. Files moved into the project's folder are found there.
+- Project files are **encrypted** with a password you choose. The first Save of a new project asks for it twice; it's kept in memory until the project is closed, so later saves don't ask. Opening a project asks for its password (a wrong one says so and lets you try again). **File > Change Project Password…** sets a new one and saves with it. A password can't be recovered: without it the project can't be opened. Plain projects from earlier versions still open; they're saved encrypted the next time (the status bar says so).
 - New, Open and quitting ask first when there are unsaved changes.
 
 ### Exporting
@@ -42,6 +43,7 @@ Flicker is one window: the player at the top, the timeline under it, and a menu 
 
 - Exported files carry no tags copied from the source (title, comment, camera, GPS location, dates), no chapters and no data tracks.
 - They carry no encoder name or version and no creation time. x264's version string, which sits inside the H.264 stream, is removed too. All of this happens while the file is written: no unscrubbed copy is ever on disk, not even for a moment. (Each track's encoder tag is left as a single space, the only way to stop ffmpeg filling in "Lavc libx264".) **File > Preferences > Write encoder name and dates into exported files** turns the encoder name and today's date back on (off by default). MKV and WebM must name the writing program: there it's just `Lavf`, with no version.
+- **Projects are encrypted.** A `.flicker` file is a short header (`FLKPRJ`, a version byte, a random salt and nonce) and then ciphertext: no clip names, paths or times in clear. The key comes from your password with Argon2id (64 MiB, 3 passes); the contents are sealed with XChaCha20-Poly1305 (the header too is authenticated, so any change to the file is noticed). Salt and nonce are new on every save. The project's JSON only exists in memory and is wiped after use; the `name.flicker-part` file written just before the rename holds only ciphertext and is readable by you alone. The password is wiped from memory on New, Open and quitting.
 - **No network**, ever, and no recent-files list. Settings (the theme and that one tick) are written only when you change one, to `~/.config/flicker/settings` (`%APPDATA%\Flicker\settings` on Windows).
 
 ### General
@@ -64,11 +66,11 @@ Try it with the files in `samples/`.
 cargo test            # unit tests + end-to-end tests against real ffmpeg
 ```
 
-To check the UI without a screen grabber (for scripts and CI), set `FLICKER_SCREENSHOT=out.ppm`. `FLICKER_SCREENSHOT_AFTER=<secs>` sets how long it waits first, `FLICKER_AUTOPLAY=1` starts playing, `FLICKER_SEEK=3.5` moves the playhead, `FLICKER_SELECT=V1:2` selects the third clip on V1, `FLICKER_ZOOM=60` sets the zoom (pixels per second), `FLICKER_DIALOG=shortcuts`, `about` or `unsaved` opens that dialog and `FLICKER_EXPORT=out.mp4` starts exporting there. `FLICKER_SYNC_LOG=file` writes, for every frame played, the sound clock and the frame's time, and how long each decode took to show its first frame.
+To check the UI without a screen grabber (for scripts and CI), set `FLICKER_SCREENSHOT=out.ppm`. `FLICKER_SCREENSHOT_AFTER=<secs>` sets how long it waits first, `FLICKER_AUTOPLAY=1` starts playing, `FLICKER_SEEK=3.5` moves the playhead, `FLICKER_SELECT=V1:2` selects the third clip on V1, `FLICKER_ZOOM=60` sets the zoom (pixels per second), `FLICKER_DIALOG=shortcuts`, `about`, `unsaved`, `password` or `change-password` opens that dialog and `FLICKER_EXPORT=out.mp4` starts exporting there. `FLICKER_SYNC_LOG=file` writes, for every frame played, the sound clock and the frame's time, and how long each decode took to show its first frame.
 
 When testing playback on a machine with speakers, point ALSA at a file that only defines a null device, e.g. `ALSA_CONFIG_PATH=silent.conf` with `pcm.!default { type null }` in it. Don't list `/usr/share/alsa/alsa.conf` in front of it: that file loads `~/.asoundrc`, which can win.
 
-To see the ffmpeg arguments behind a project: `cargo run -p flicker-core --example graph -- project.flicker [preview|sound|export] [from] [to]`.
+To see the ffmpeg arguments behind a project: `cargo run -p flicker-core --example graph -- project.flicker [preview|sound|export] [from] [to]` (it reads an encrypted project's password from stdin).
 
 ## Project layout
 
@@ -79,7 +81,7 @@ crates/
     ffmpeg.rs        FfmpegCli: engine that drives ffmpeg/ffprobe executables
     timeline.rs      Tracks and clips, and every timeline edit (move, trim, split, transitions…)
     render.rs        The timeline as an ffmpeg filter graph: export and preview arguments
-    project.rs       .flicker project files
+    project.rs       .flicker project files (Argon2id + XChaCha20-Poly1305)
     privacy.rs       Private saves: no source tags, encoder names or dates
     subtitles.rs     Subtitle formats, filter-path escaping, embedding
     preview.rs       Frames and PCM for on-screen playback

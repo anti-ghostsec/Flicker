@@ -11,7 +11,18 @@ fn main() {
         eprintln!("usage: graph PROJECT [preview|sound|export] [FROM] [TO]");
         std::process::exit(2);
     };
-    let t = project::load(path.as_ref()).unwrap_or_else(|e| panic!("{e}"));
+    // Encrypted projects: the password is read from stdin.
+    let t = match project::load(path.as_ref(), None) {
+        Err(flicker_core::Error::PasswordNeeded) => {
+            eprint!("password: ");
+            let mut pw = zeroize::Zeroizing::new(String::new());
+            std::io::stdin().read_line(&mut pw).expect("stdin");
+            project::load(path.as_ref(), Some(pw.trim_end_matches(['\r', '\n'])))
+        }
+        r => r,
+    }
+    .unwrap_or_else(|e| panic!("{e}"))
+    .timeline;
     let secs = |i: usize, d: f64| args.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
     let opts = PreviewOpts {
         canvas: t.suggested_canvas().fit_within(960, 540, 30.0),

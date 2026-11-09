@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use flicker_core::Timeline;
+use zeroize::Zeroizing;
 
 /// How many edits can be undone.
 const HISTORY: usize = 200;
@@ -21,6 +22,12 @@ pub struct Project {
     pending: Option<(Timeline, String)>,
     /// Bumped on every change, so the player knows to catch up.
     version: u64,
+    /// The password the file is encrypted with, once chosen or entered.
+    /// Wiped when the project is closed (New, Open, quitting).
+    pub password: Option<Zeroizing<String>>,
+    /// Opened from a plain file written by an earlier Flicker: it counts as
+    /// unsaved until it's saved encrypted.
+    pub was_plain: bool,
 }
 
 impl Default for Project {
@@ -39,6 +46,8 @@ impl Project {
             redo: Vec::new(),
             pending: None,
             version: 0,
+            password: None,
+            was_plain: false,
         }
     }
 
@@ -129,15 +138,21 @@ impl Project {
         true
     }
 
-    /// Changed since it was last saved.
-    pub fn is_dirty(&self) -> bool {
+    /// The timeline changed since it was last saved.
+    pub fn has_changes(&self) -> bool {
         self.timeline != self.saved
+    }
+
+    /// Unsaved: changed, or still a plain file on disk.
+    pub fn is_dirty(&self) -> bool {
+        self.was_plain || self.has_changes()
     }
 
     pub fn mark_saved(&mut self, path: &Path) {
         self.finish();
         self.saved = self.timeline.clone();
         self.path = Some(path.to_path_buf());
+        self.was_plain = false;
     }
 
     /// "holiday.flicker", or "Untitled".
@@ -244,5 +259,10 @@ mod tests {
         assert_eq!(p.name(), "holiday.flicker");
         assert_eq!(p.suggested_path("mp4"), PathBuf::from("/x/holiday.mp4"));
         assert_eq!(Project::default().name(), "Untitled");
+        // An old plain file is unsaved until it's saved encrypted.
+        p.was_plain = true;
+        assert!(p.is_dirty());
+        p.mark_saved(Path::new("/x/holiday.flicker"));
+        assert!(!p.is_dirty());
     }
 }
