@@ -194,8 +194,7 @@ pub(crate) fn split_args(
     pattern: &Path,
 ) -> Vec<OsString> {
     let mut a = base_args();
-    a.push("-i".into());
-    a.push(input.into());
+    a.extend(crate::input::args(input));
     a.push("-t".into());
     a.push(format!("{:.6}", until.as_secs_f64()).into());
     // Subtitles are retimed separately (see `retime`), not cut here.
@@ -262,8 +261,8 @@ pub(crate) fn concat_list(parts: &[(PathBuf, Duration)]) -> String {
 /// `total` is the output length.
 pub(crate) fn concat_args(list: &Path, output: &Path, total: Duration) -> Vec<OsString> {
     let mut a = base_args();
-    a.extend(strs(&["-f", "concat", "-safe", "0", "-i"]));
-    a.push(list.into());
+    a.extend(strs(&["-f", "concat", "-safe", "0"]));
+    a.extend(crate::input::args(list));
     a.extend(strs(&["-map", "0", "-c", "copy"]));
     a.push("-t".into());
     a.push(format!("{:.6}", total.as_secs_f64()).into());
@@ -309,15 +308,12 @@ pub(crate) fn mux_subtitles_args(
     output: &Path,
 ) -> Vec<OsString> {
     let mut a = base_args();
-    a.push("-i".into());
-    a.push(av.into());
+    a.extend(crate::input::args(av));
     for (_, _, file) in subs {
-        a.push("-i".into());
-        a.push(file.into());
+        a.extend(crate::input::args(file));
     }
     let source_input = subs.len() + 1;
-    a.push("-i".into());
-    a.push(source.into());
+    a.extend(crate::input::args(source));
     a.extend(strs(&["-map", "0:v", "-map", "0:a?"]));
     for k in 0..subs.len() {
         a.push("-map".into());
@@ -345,8 +341,7 @@ pub(crate) fn precise_args(req: &TrimRequest, has_audio: bool, output: &Path) ->
         a.push(format!("{:.3}", r.start.as_secs_f64()).into());
         a.push("-t".into());
         a.push(format!("{:.3}", r.len().as_secs_f64()).into());
-        a.push("-i".into());
-        a.push(req.input.clone().into());
+        a.extend(crate::input::args(&req.input));
         pads += &format!("[{i}:v:0]");
         if has_audio {
             pads += &format!("[{i}:a:0]");
@@ -472,7 +467,7 @@ mod tests {
                 .join(" ")
         };
         let with_audio = joined(true);
-        assert!(with_audio.contains("-ss 4.000 -t 2.000 -i in.mp4"), "{with_audio}");
+        assert!(with_audio.contains("-ss 4.000 -t 2.000 -protocol_whitelist file -i file:in.mp4"), "{with_audio}");
         assert!(with_audio.contains("[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[v][a]"));
         assert!(joined(false).contains("[0:v:0][1:v:0]concat=n=2:v=1:a=0[v]"));
     }

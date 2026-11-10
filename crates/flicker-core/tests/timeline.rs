@@ -405,3 +405,73 @@ fn a_cancelled_export_leaves_nothing() {
     assert!(FfmpegCli::locate().export_timeline(&req, &mut |_| {}, &CancelToken::new()).is_err());
     assert_eq!(std::fs::read(&out).unwrap(), b"old");
 }
+
+/// A project from someone else that names a web address as a clip (and as
+/// its subtitles), in a file next to it and in the project itself: opening
+/// it, showing a frame, playing its sound and exporting never connect
+/// anywhere. The address is a listener on this computer.
+#[test]
+fn a_project_never_makes_ffmpeg_connect_out() {
+    let Some(dir) = workdir("offline") else { return };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}");
+    let real = dir.join("real.mp4");
+    ffmpeg(
+        &["-f", "lavfi", "-i", "color=c=blue:size=160x120:rate=10:duration=2", "-f", "lavfi", "-i",
+          "anullsrc=r=44100:cl=stereo", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"],
+        &real,
+    );
+    // A playlist dressed up as a video, next to the project.
+    let list = dir.join("list.mp4");
+    std::fs::write(&list, format!("#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\n{url}/seg.ts\n#EXT-X-ENDLIST\n")).unwrap();
+
+    let mut t = Timeline::default();
+    t.append(TrackRef::V1, Clip::video(format!("{url}/x.mp4").into(), s(2), true)).unwrap();
+    t.append(TrackRef::V1, Clip::video(list.clone(), s(2), true)).unwrap();
+    t.append(TrackRef::V1, clip(&real)).unwrap();
+    t.add_clip(TrackRef::A1, Clip::audio(format!("{url}/x.mp3").into(), s(2)), s(0)).unwrap();
+    t.subtitle = Some(format!("{url}/s.srt").into());
+    let file = dir.join("p.flicker");
+    std::fs::write(&file, &*flicker_core::project::to_json(&t)).unwrap();
+
+    let opened = flicker_core::project::load(&file, None).unwrap();
+    assert!(opened.was_plain);
+    let t = opened.timeline;
+    assert_eq!(t.video[0].clips.len(), 3, "no clip is dropped");
+    assert_eq!(t.video[0].clips[0].path, dir.join("x.mp4"));
+    assert_eq!(t.video[0].clips[2].path, real);
+
+    let engine = FfmpegCli::locate();
+    assert!(engine.probe(&list).is_err());
+    // The frame the player shows as soon as a project opens, the sound, and
+    // an export: each fails on the missing files (or is refused) quietly.
+    for at in [0, 2, 4] {
+        let shown = engine.open_timeline_frames(&preview(&t, s(at), true)).and_then(|mut f| f.next_frame());
+        assert_eq!(shown.is_ok(), at == 4, "at {at}s");
+    }
+    if let Ok(mut sound) = engine.open_timeline_sound(&preview(&t, s(0), false)) {
+        let mut buf = vec![0u8; 1 << 16];
+        while matches!(sound.read(&mut buf), Ok(n) if n > 0) {}
+    }
+    let out = dir.join("out.mp4");
+    assert!(engine.export_timeline(&ExportRequest::new(t.clone(), out.clone()), &mut |_| {}, &CancelToken::new()).is_err());
+
+    // The same without the check when opening: what the timeline names
+    // still reaches ffmpeg as a file's name only.
+    let mut raw = Timeline::default();
+    raw.append(TrackRef::V1, Clip::video(format!("{url}/x.mp4").into(), s(2), true)).unwrap();
+    raw.add_clip(TrackRef::A1, Clip::audio(format!("{url}/x.mp3").into(), s(2)), s(0)).unwrap();
+    raw.subtitle = Some(format!("{url}/s.srt").into());
+    let with_subtitles = TimelinePreview { subtitles: true, ..preview(&raw, s(0), true) };
+    assert!(engine.open_timeline_frames(&with_subtitles).and_then(|mut f| f.next_frame()).is_err());
+    if let Ok(mut sound) = engine.open_timeline_sound(&preview(&raw, s(0), false)) {
+        let mut buf = vec![0u8; 1 << 16];
+        while matches!(sound.read(&mut buf), Ok(n) if n > 0) {}
+    }
+
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(listener.accept().is_err(), "ffmpeg connected to {url}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

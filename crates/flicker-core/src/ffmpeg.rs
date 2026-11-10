@@ -81,7 +81,7 @@ impl Engine for FfmpegCli {
         }
         let out = command(&self.ffprobe)
             .args(["-v", "error", "-print_format", "json", "-show_format", "-show_streams"])
-            .arg(path)
+            .args(crate::input::probe_args(path))
             .output()
             .map_err(|e| spawn_error(&self.ffprobe, e))?;
         if !out.status.success() {
@@ -155,7 +155,7 @@ impl Engine for FfmpegCli {
         let out = command(&self.ffprobe)
             .args(["-v", "error", "-select_streams", "v:0"])
             .args(["-show_entries", "packet=pts_time,flags", "-of", "csv=p=0"])
-            .arg(path)
+            .args(crate::input::probe_args(path))
             .output()
             .map_err(|e| spawn_error(&self.ffprobe, e))?;
         if !out.status.success() {
@@ -510,8 +510,7 @@ impl FfmpegCli {
             .collect();
 
         let mut extract = edit::base_args();
-        extract.push("-i".into());
-        extract.push(req.input.clone().into());
+        extract.extend(crate::input::args(&req.input));
         for ((i, _), file) in subs.iter().zip(&files) {
             extract.push("-map".into());
             extract.push(format!("0:s:{i}").into());
@@ -642,18 +641,38 @@ impl Drop for FfmpegFrames {
     }
 }
 
-/// A scratch directory removed when dropped.
+/// A scratch directory removed when dropped. It has a random name, is made
+/// new (never one that's already there) and only the user can look inside.
 struct TempDir(PathBuf);
 
 impl TempDir {
+    /// In the user's own runtime folder when there is one, else in the
+    /// system's temporary folder.
     fn new() -> Result<Self> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let dir = std::env::temp_dir().join(format!("flicker-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
-        Ok(Self(dir))
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_absolute() && d.is_dir());
+        Self::new_in(&runtime.unwrap_or_else(std::env::temp_dir))
+    }
+
+    fn new_in(base: &Path) -> Result<Self> {
+        #[allow(unused_mut)]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        loop {
+            let mut r = [0u8; 16];
+            getrandom::fill(&mut r).map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+            let name: String = r.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = base.join(format!("flicker-{name}"));
+            // Fails if anything of that name exists, a link included.
+            match builder.create(&dir) {
+                Ok(()) => return Ok(Self(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 }
 
@@ -826,6 +845,37 @@ mod tests {
         assert!((info.streams[0].frame_rate.unwrap() - 29.97).abs() < 0.01);
         assert_eq!(parse_rate(Some("0/0")), None);
         assert_eq!(info.video_length(), info.duration, "no stream lengths: use the file's");
+    }
+
+    #[test]
+    fn scratch_folders_are_private_and_unguessable() {
+        let base = std::env::temp_dir().join(format!("flicker-scratch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let (a, b) = (TempDir::new_in(&base).unwrap(), TempDir::new_in(&base).unwrap());
+        let pid = std::process::id().to_string();
+        for d in [&a, &b] {
+            assert!(d.0.is_dir() && d.0.parent() == Some(base.as_path()));
+            let name = d.0.file_name().unwrap().to_string_lossy().into_owned();
+            // 128 random bits, and nothing an onlooker could work out.
+            assert_eq!(name.len(), "flicker-".len() + 32, "{name}");
+            assert!(!name.contains(&pid), "{name}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(&d.0).unwrap().permissions().mode() & 0o777, 0o700);
+            }
+        }
+        assert_ne!(a.0, b.0);
+        // The one the engine uses is made the same way.
+        let c = TempDir::new().unwrap();
+        assert_eq!(c.0.file_name().unwrap().len(), "flicker-".len() + 32);
+        let (kept, gone) = (a.0.clone(), c.0.clone());
+        std::fs::write(kept.join("piece.mp4"), b"x").unwrap();
+        drop((a, c));
+        assert!(!kept.exists() && !gone.exists() && b.0.is_dir());
+        drop(b);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

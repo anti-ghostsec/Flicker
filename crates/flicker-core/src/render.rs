@@ -211,7 +211,7 @@ pub fn render_graph(t: &Timeline, o: &RenderOpts) -> (Vec<OsString>, String) {
                 inputs.extend(["-t".into(), secs(p.len + preroll(p)).into()]);
             }
         }
-        inputs.extend(["-i".into(), p.clip.path.clone().into()]);
+        inputs.extend(crate::input::args(&p.clip.path));
 
         if p.picture {
             let upper = p.layer > 0;
@@ -411,8 +411,7 @@ pub fn export_args(req: &ExportRequest) -> Vec<OsString> {
     a.extend(inputs);
     let soft = subtitle.filter(|_| t.subtitle_export == SubtitleExport::Track);
     if let Some(sub) = soft {
-        a.push("-i".into());
-        a.push(sub.into());
+        a.extend(crate::input::args(sub));
     }
     a.push("-filter_complex".into());
     a.push(graph.into());
@@ -545,10 +544,10 @@ mod tests {
         let t = project();
         let (inputs, g) = render_graph(&t, &whole(&t));
         let i = join(&inputs);
-        assert!(i.contains("-t 10.000000 -i a.mp4"), "{i}");
-        assert!(i.contains("-t 10.000000 -i a.mp4 -i b.png"), "{i}");
+        assert!(i.contains("-t 10.000000 -protocol_whitelist file -i file:a.mp4"), "{i}");
+        assert!(i.contains("-t 10.000000 -protocol_whitelist file -i file:a.mp4 -protocol_whitelist file -i file:b.png"), "{i}");
         assert!(g.contains("format=yuv420p,loop=loop=-1:size=1,setpts=N/(30)/TB,trim=duration=4.000000,setpts"), "{g}");
-        assert!(i.contains("-t 30.000000 -i m.mp3"), "{i}");
+        assert!(i.contains("-t 30.000000 -protocol_whitelist file -i file:m.mp3"), "{i}");
         assert!(g.contains("color=c=black:s=1280x720:r=30:d=32.000000"), "{g}");
         assert!(g.contains("setpts=PTS-STARTPTS+10.000000/TB[pv1]"), "{g}");
         assert!(g.contains("[ov0][pv1]overlay=eof_action=pass:enable='between(t,10.000000,13.999999)'[ov1]"), "{g}");
@@ -606,10 +605,10 @@ mod tests {
         let o = RenderOpts { from: s(8), to: s(12), ..whole(&t) };
         let (inputs, g) = render_graph(&t, &o);
         let i = join(&inputs);
-        assert!(i.contains("-ss 7.500000 -t 2.500000 -i a.mp4"), "{i}");
+        assert!(i.contains("-ss 7.500000 -t 2.500000 -protocol_whitelist file -i file:a.mp4"), "{i}");
         assert!(g.contains("[0:v:0]trim=start=0.500000,scale="), "{g}");
         assert!(g.contains("trim=duration=2.000000,setpts=PTS-STARTPTS+0.000000/TB"), "{g}");
-        assert!(i.contains("-ss 5.500000 -t 4.500000 -i m.mp3"), "{i}");
+        assert!(i.contains("-ss 5.500000 -t 4.500000 -protocol_whitelist file -i file:m.mp3"), "{i}");
         assert!(g.contains("[2:a:0]atrim=start=0.500000,asetpts=PTS-STARTPTS"), "{g}");
         assert!(!i.contains("c.mp4"), "{i}");
         // a's fade-out still runs from 6s in a's time.
@@ -648,13 +647,49 @@ mod tests {
         t.subtitle_export = SubtitleExport::Track;
         let req = ExportRequest::new(t.clone(), "out.mp4".into());
         let a = join(&export_args(&req));
-        assert!(a.contains("-i s.srt -filter_complex"), "{a}");
+        assert!(a.contains("-protocol_whitelist file -i file:s.srt -filter_complex"), "{a}");
         assert!(a.contains("-map 4:s:0 -c:s mov_text -metadata:s:s:0 language=eng"), "{a}");
         assert!(a.contains("filter_units=remove_types=6"), "{a}");
         t.subtitle_export = SubtitleExport::Burn;
         let req = ExportRequest::new(t, "out.mp4".into());
         let a = join(&export_args(&req));
-        assert!(a.contains("subtitles=filename=s.srt[vout]") && !a.contains("-i s.srt"), "{a}");
+        assert!(a.contains(r"subtitles=filename=file\\:s.srt[vout]") && !a.contains("-i file:s.srt"), "{a}");
+    }
+
+    /// Whatever a clip or subtitle file is called, ffmpeg gets it as a
+    /// local file, and may read inputs from local files only.
+    #[test]
+    fn every_input_is_a_local_file() {
+        let mut t = Timeline::default();
+        t.append(TrackRef::V1, Clip::video("http://127.0.0.1:9/x.mp4".into(), s(4), true)).unwrap();
+        t.append(TrackRef::V1, Clip::image("-safe".into())).unwrap();
+        t.add_clip(TrackRef::A1, Clip::audio("concat:a.mp3|b.mp3".into(), s(4)), s(0)).unwrap();
+        t.subtitle = Some("tcp://127.0.0.1:9/s.srt".into());
+        t.subtitle_export = SubtitleExport::Track;
+        let p = PreviewOpts { canvas: Canvas::default(), from: s(0), to: s(8), subtitles: true, single_frame: false };
+        let mut burn = t.clone();
+        burn.subtitle_export = SubtitleExport::Burn;
+        let all = [
+            (3, export_args(&ExportRequest::new(t.clone(), "out.mp4".into()))),
+            (2, export_args(&ExportRequest::new(burn, "out.mp4".into()))),
+            (1, preview_video_args(&t, &p)),
+            (1, preview_audio_args(&t, &p)),
+        ];
+        for (extra, a) in all {
+            // Only the inputs and the output name aren't written by Flicker.
+            let mut inputs = 0;
+            for (i, x) in a.iter().enumerate() {
+                let x = x.to_string_lossy();
+                if x == "-i" {
+                    inputs += 1;
+                    assert_eq!(a[i - 2..i], ["-protocol_whitelist", "file"].map(OsString::from), "{}", join(&a));
+                    assert!(a[i + 1].to_string_lossy().starts_with("file:"), "{}", join(&a));
+                }
+                let named = ["127.0.0.1", "concat:", "-safe"].iter().any(|n| x.contains(n));
+                assert!(!named || x.starts_with("file:") || x.contains(r"subtitles=filename=file\\:tcp\\://"), "{x}");
+            }
+            assert_eq!(inputs, extra + 1, "{}", join(&a));
+        }
     }
 
     #[test]
@@ -663,8 +698,8 @@ mod tests {
         t.subtitle = Some("s.srt".into());
         let p = PreviewOpts { canvas: Canvas { width: 640, height: 360, fps: 25.0 }, from: s(2), to: s(4), subtitles: true, single_frame: true };
         let a = join(&preview_video_args(&t, &p));
-        assert!(a.contains("-threads 1 -ss 1.500000 -t 2.500000 -i a.mp4"), "{a}");
-        assert!(a.contains("setpts=PTS+2.000000/TB,subtitles=filename=s.srt[vout]"), "{a}");
+        assert!(a.contains("-threads 1 -ss 1.500000 -t 2.500000 -protocol_whitelist file -i file:a.mp4"), "{a}");
+        assert!(a.contains(r"setpts=PTS+2.000000/TB,subtitles=filename=file\\:s.srt[vout]"), "{a}");
         assert!(a.contains("-frames:v 1 -f image2pipe"), "{a}");
         assert!(!a.contains("m.mp3"), "no sound inputs for the picture: {a}");
         let a = join(&preview_audio_args(&t, &p));

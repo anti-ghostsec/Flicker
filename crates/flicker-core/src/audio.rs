@@ -71,8 +71,7 @@ pub fn filter(edit: AudioEdit, len: Duration) -> Option<String> {
 /// ffmpeg arguments for an audio edit. `len` is the sound's length.
 pub fn audio_args(req: &AudioRequest, len: Duration) -> Vec<OsString> {
     let mut a = crate::edit::base_args();
-    a.push("-i".into());
-    a.push(req.input.clone().into());
+    a.extend(crate::input::args(&req.input));
     let filter = filter(req.edit, len);
     // Mute leaves the sound tracks out.
     let sound: &[&str] = if filter.is_some() { &["-map", "0:a?"] } else { &[] };

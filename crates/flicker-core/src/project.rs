@@ -80,7 +80,10 @@ impl Write for Counter {
 }
 
 /// Read a project from its JSON. Files that moved along with the project
-/// (into its folder) are found there.
+/// (into its folder) are found there. A project can come from someone else,
+/// so the paths in it aren't trusted: only full paths to files on this
+/// computer are kept, and anything else becomes a missing file (see
+/// [`crate::input::from_project`]). Clips are never dropped.
 pub fn from_json(json: &[u8], project_dir: Option<&Path>) -> Result<Timeline> {
     let file: ProjectFile = serde_json::from_slice(json).map_err(|e| Error::Project(e.to_string()))?;
     if file.flicker_project > VERSION {
@@ -93,14 +96,7 @@ pub fn from_json(json: &[u8], project_dir: Option<&Path>) -> Result<Timeline> {
     if t.audio.is_empty() {
         t.audio.push(crate::Track::new(crate::TrackKind::Audio));
     }
-    let relocate = |p: &mut PathBuf| {
-        if let (false, Some(dir), Some(name)) = (p.is_file(), project_dir, p.file_name()) {
-            let near = dir.join(name);
-            if near.is_file() {
-                *p = near;
-            }
-        }
-    };
+    let relocate = |p: &mut PathBuf| *p = crate::input::from_project(p, project_dir);
     for track in t.video.iter_mut().chain(t.audio.iter_mut()) {
         track.clips.sort_by_key(|c| c.start);
         for c in &mut track.clips {
@@ -337,6 +333,51 @@ mod tests {
         let again = std::fs::read(&file).unwrap();
         assert_ne!(data[7..HEADER_LEN], again[7..HEADER_LEN]);
         assert_ne!(data[HEADER_LEN..], again[HEADER_LEN..]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A project naming things that aren't files on this computer, as the
+    /// old plain format and encrypted.
+    #[test]
+    fn paths_in_a_project_are_not_trusted() {
+        let dir = dir("hostile");
+        let real = dir.join("real.mp4");
+        std::fs::write(&real, b"x").unwrap();
+        let bad = [
+            "http://127.0.0.1:9/x.mp4",
+            "tcp://127.0.0.1:9",
+            "concat:/etc/hostname|/etc/hostname",
+            "pipe:0",
+            "-safe",
+            "relative/clip.mp4",
+            "subfile,,start,0,end,9,,:/etc/hostname",
+        ];
+        let mut t = Timeline::default();
+        t.append(TrackRef::V1, Clip::video(real.clone(), Duration::from_secs(1), true)).unwrap();
+        for b in bad {
+            t.append(TrackRef::V1, Clip::video(b.into(), Duration::from_secs(1), true)).unwrap();
+            t.append(TrackRef::A1, Clip::audio(b.into(), Duration::from_secs(1))).unwrap();
+        }
+        t.subtitle = Some("http://127.0.0.1:9/s.srt".into());
+
+        let plain = dir.join("plain.flicker");
+        std::fs::write(&plain, &*to_json(&t)).unwrap();
+        let sealed = dir.join("sealed.flicker");
+        save(&sealed, &t, "pw").unwrap();
+        for (file, pw) in [(&plain, None), (&sealed, Some("pw"))] {
+            let back = load(file, pw).unwrap().timeline;
+            // Nothing is dropped: every clip is still there, in its place.
+            assert_eq!(back.video[0].clips.len(), 1 + bad.len());
+            assert_eq!(back.audio[0].clips.len(), bad.len());
+            assert_eq!(back.duration(), t.duration());
+            assert_eq!(back.video[0].clips[0].path, real);
+            for f in back.files().filter(|f| *f != real) {
+                // Each is now a missing file in the project's folder.
+                assert!(f.is_absolute() && f.starts_with(&dir) && !f.exists(), "{f:?}");
+            }
+            assert_eq!(back.subtitle, Some(dir.join("s.srt")));
+            assert_eq!(back.video[0].clips[1].name(), "x.mp4");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

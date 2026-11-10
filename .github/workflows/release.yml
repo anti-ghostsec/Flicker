@@ -21,9 +21,16 @@ concurrency:
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    # Only master is ever built, signed and published, also when the
+    # workflow is started by hand from another branch.
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit, not a tag that can be moved.
+      # The token isn't left in .git for the build to find.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Checked before the (slow) build, so a missing key fails fast.
       - name: Check signing key

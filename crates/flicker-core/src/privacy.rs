@@ -104,8 +104,8 @@ pub fn output_args(keep_tags: bool, drop_source_tags: bool, h264: bool) -> Vec<O
 /// and, unless `keep_tags`, without encoder names or dates. `info` describes
 /// `input`.
 pub fn scrub_args(input: &Path, output: &Path, info: &MediaInfo, keep_tags: bool) -> Vec<OsString> {
-    let mut a: Vec<OsString> = ["-y", "-hide_banner", "-nostdin", "-v", "error", "-i"].map(OsString::from).to_vec();
-    a.push(input.into());
+    let mut a: Vec<OsString> = ["-y", "-hide_banner", "-nostdin", "-v", "error"].map(OsString::from).to_vec();
+    a.extend(crate::input::args(input));
     // Picture, sound and subtitles only: data tracks can hold GPS logs.
     a.extend(["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy"].map(OsString::from));
     a.extend(["-map_metadata", "-1", "-map_chapters", "-1"].map(OsString::from));
@@ -142,8 +142,7 @@ pub fn scrub_args(input: &Path, output: &Path, info: &MediaInfo, keep_tags: bool
 /// become WebVTT; image subtitles are left out (WebM can't hold them).
 pub fn webm_args(input: &Path, output: &Path, info: &MediaInfo, keep_tags: bool) -> Vec<OsString> {
     let mut a = crate::edit::base_args();
-    a.push("-i".into());
-    a.push(input.into());
+    a.extend(crate::input::args(input));
     a.extend(["-map", "0:v:0", "-map", "0:a?"].map(OsString::from));
     let subs: Vec<&str> =
         info.streams.iter().filter(|s| s.kind == StreamKind::Subtitle).map(|s| s.codec.as_str()).collect();

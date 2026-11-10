@@ -10,6 +10,7 @@ pub mod edit;
 pub mod engine;
 pub mod error;
 pub mod ffmpeg;
+pub mod input;
 pub mod job;
 pub mod media;
 pub mod preview;

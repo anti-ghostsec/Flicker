@@ -143,13 +143,11 @@ pub fn ffmpeg_args(req: &EmbedRequest, existing_subs: usize) -> Vec<OsString> {
     let container = OutputContainer::from_path(&req.output);
     let mut a = Args::default();
     a.push_all(["-y", "-hide_banner", "-nostdin", "-progress", "pipe:1", "-nostats"]);
-    a.push("-i");
-    a.push(&req.video);
+    a.0.extend(crate::input::args(&req.video));
 
     match req.mode {
         EmbedMode::Soft => {
-            a.push("-i");
-            a.push(&req.subtitle);
+            a.0.extend(crate::input::args(&req.subtitle));
             a.push_all(["-map", "0:v", "-map", "0:a?"]);
             if req.keep_existing {
                 a.push_all(["-map", "0:s?"]);
@@ -209,10 +207,12 @@ pub fn ffmpeg_args(req: &EmbedRequest, existing_subs: usize) -> Vec<OsString> {
 /// Escape a path for use as `subtitles=filename=<here>` inside `-vf`.
 ///
 /// FFmpeg parses filter graphs twice: once for the option value and once for
-/// the graph, so special characters need two levels of escaping.
+/// the graph, so special characters need two levels of escaping. The filter
+/// opens its file as a URL, like an input: `file:` in front keeps any name a
+/// file's name (see [`crate::input`]).
 pub(crate) fn escape_filter_path(path: &Path) -> String {
     // Forward slashes work on Windows too and avoid one class of escaping.
-    let raw = path.to_string_lossy().replace('\\', "/");
+    let raw = format!("file:{}", path.to_string_lossy().replace('\\', "/"));
     let level1 = escape_chars(&raw, &['\\', '\'', ':']);
     escape_chars(&level1, &['\\', '\'', '[', ']', ',', ';'])
 }
@@ -282,15 +282,18 @@ mod tests {
         req.mode = EmbedMode::Hard;
         req.keep_existing = false;
         let s = args_str(&req, 0);
-        assert!(s.contains("-vf subtitles=filename=s.srt"), "{s}");
+        assert!(s.contains(r"-vf subtitles=filename=file\\:s.srt"), "{s}");
         assert!(s.contains("-c:v libx264"), "{s}");
-        assert!(!s.contains("-i s.srt"), "{s}");
+        assert!(!s.contains("-i file:s.srt"), "{s}");
     }
 
     #[test]
     fn filter_path_escaping() {
-        assert_eq!(escape_filter_path(Path::new("a'b.srt")), r"a\\\'b.srt");
-        assert_eq!(escape_filter_path(Path::new("C:\\x,y.srt")), r"C\\:/x\,y.srt");
+        assert_eq!(escape_filter_path(Path::new("a'b.srt")), r"file\\:a\\\'b.srt");
+        assert_eq!(escape_filter_path(Path::new("C:\\x,y.srt")), r"file\\:C\\:/x\,y.srt");
+        // Nothing in a name ends the filter or starts another one.
+        let odd = escape_filter_path(Path::new("/v/a.srt[x];movie=http://127.0.0.1:9/x.mp4,null"));
+        assert_eq!(odd, r"file\\:/v/a.srt\[x\]\;movie=http\\://127.0.0.1\\:9/x.mp4\,null");
     }
 
     #[test]

@@ -119,8 +119,8 @@ pub(crate) fn ffmpeg_args(req: &PreviewRequest) -> Vec<OsString> {
         a.push(format!("{:.3}", req.start.as_secs_f64()).into());
     }
     // Keep the original timestamps so subtitles line up after seeking.
-    a.extend(strs(&["-copyts", "-i"]));
-    a.push(req.video.clone().into());
+    a.push("-copyts".into());
+    a.extend(crate::input::args(&req.video));
     a.extend(strs(&["-an", "-sn", "-dn", "-vf"]));
     a.push(filters.join(",").into());
     if req.single_frame {
@@ -209,8 +209,8 @@ mod tests {
         let s: Vec<String> =
             ffmpeg_args(&req).iter().map(|a| a.to_string_lossy().into_owned()).collect();
         let s = s.join(" ");
-        assert!(s.contains("-ss 1.500 -copyts -i in.mp4"), "{s}");
-        assert!(s.contains("subtitles=filename=s.srt"), "{s}");
+        assert!(s.contains("-ss 1.500 -copyts -protocol_whitelist file -i file:in.mp4"), "{s}");
+        assert!(s.contains(r"subtitles=filename=file\\:s.srt"), "{s}");
         assert!(s.contains("-frames:v 1"), "{s}");
     }
 }

@@ -17,9 +17,14 @@ pub const APP_NAME: &str = "Flicker";
 #[cfg(not(target_os = "android"))]
 pub fn run_desktop() -> eframe::Result {
     // `flicker project.flicker`, or `flicker video.mp4 music.mp3 [subs.srt]`
-    // (also how "Open with…" passes files).
-    let files: Vec<std::path::PathBuf> =
-        std::env::args_os().skip(1).map(std::path::PathBuf::from).filter(|p| p.is_file()).collect();
+    // (also how "Open with…" passes files). Full paths, so a project saved
+    // from here finds them again whatever folder Flicker starts in.
+    let files: Vec<std::path::PathBuf> = std::env::args_os()
+        .skip(1)
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .map(|p| std::path::absolute(&p).unwrap_or(p))
+        .collect();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(APP_NAME)

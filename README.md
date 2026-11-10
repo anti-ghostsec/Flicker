@@ -28,6 +28,7 @@ Flicker is one window: the player at the top, the timeline under it, and a menu 
 
 - **File > New Project** (`Ctrl+N`), **Open Project…** (`Ctrl+O`), **Save Project** (`Ctrl+S`) and **Save Project As…** (`Ctrl+Shift+S`). A project is a small `.flicker` file that points at your files; nothing is copied. Files moved into the project's folder are found there.
 - Project files are **encrypted** with a password you choose. The first Save of a new project asks for it twice; it's kept in memory until the project is closed, so later saves don't ask. Opening a project asks for its password (a wrong one says so and lets you try again). **File > Change Project Password…** sets a new one and saves with it. A password can't be recovered: without it the project can't be opened. Plain projects from earlier versions still open; they're saved encrypted the next time (the status bar says so).
+- A project from someone else can't make Flicker open anything but files on your computer. When a project is opened (encrypted, or a plain one from an earlier version), a clip or subtitle file is used only if it's a full path to a file that's there, or a file of that name in the project's folder. A file that's gone stays on the timeline and the status bar names it as missing; anything else a project might name (a web address, a relative name, a device) is treated the same way, as a missing file of that name in the project's folder.
 - New, Open and quitting ask first when there are unsaved changes.
 
 ### Exporting
@@ -44,7 +45,7 @@ Flicker is one window: the player at the top, the timeline under it, and a menu 
 - Exported files carry no tags copied from the source (title, comment, camera, GPS location, dates), no chapters and no data tracks.
 - They carry no encoder name or version and no creation time. x264's version string, which sits inside the H.264 stream, is removed too. All of this happens while the file is written: no unscrubbed copy is ever on disk, not even for a moment. (Each track's encoder tag is left as a single space, the only way to stop ffmpeg filling in "Lavc libx264".) **File > Preferences > Write encoder name and dates into exported files** turns the encoder name and today's date back on (off by default). MKV and WebM must name the writing program: there it's just `Lavf`, with no version.
 - **Projects are encrypted.** A `.flicker` file is a short header (`FLKPRJ`, a version byte, a random salt and nonce) and then ciphertext: no clip names, paths or times in clear. The key comes from your password with Argon2id (64 MiB, 3 passes); the contents are sealed with XChaCha20-Poly1305 (the header too is authenticated, so any change to the file is noticed). Salt and nonce are new on every save. The project's JSON only exists in memory and is wiped after use; the `name.flicker-part` file written just before the rename holds only ciphertext and is readable by you alone. The password is wiped from memory on New, Open and quitting.
-- **No network**, ever, and no recent-files list. Settings (the theme and that one tick) are written only when you change one, to `~/.config/flicker/settings` (`%APPDATA%\Flicker\settings` on Windows).
+- **No network**, ever, and no recent-files list. ffmpeg and ffprobe are given every file as `file:<path>` and may read inputs from local files only (`-protocol_whitelist file`), so neither a file's name nor a playlist posing as a video can make them connect anywhere. Settings (the theme and that one tick) are written only when you change one, to `~/.config/flicker/settings` (`%APPDATA%\Flicker\settings` on Windows).
 
 ### General
 
@@ -84,6 +85,7 @@ crates/
     project.rs       .flicker project files (Argon2id + XChaCha20-Poly1305)
     privacy.rs       Private saves: no source tags, encoder names or dates
     subtitles.rs     Subtitle formats, filter-path escaping, embedding
+    input.rs         How files are handed to ffmpeg (local files only), paths from projects
     preview.rs       Frames and PCM for on-screen playback
     edit.rs          TimeRange / TrimRequest (trim & cut of a single file)
     retime.rs        Shifts/clips SRT and ASS cues to match a trim
@@ -126,7 +128,7 @@ More detail in [ROADMAP.md](ROADMAP.md).
 
 ## Releases
 
-`.github/workflows/release.yml` builds, tests and publishes a signed Linux build (`flicker-linux.tar.gz` + `.minisig`) on every push to `master`. It refuses to run until `minisign.pub` holds Flicker's real public key (it's a placeholder now) and the `MINISIGN_SECRET_KEY` secret is set:
+`.github/workflows/release.yml` builds, tests and publishes a signed Linux build (`flicker-linux.tar.gz` + `.minisig`) on every push to `master` (and only from `master`; the actions it uses are pinned to a commit). It refuses to run until `minisign.pub` holds Flicker's real public key (it's a placeholder now) and the `MINISIGN_SECRET_KEY` secret is set:
 
 ```bash
 minisign -G -p minisign.pub -s flicker.key   # keep flicker.key private; put its contents in the secret
