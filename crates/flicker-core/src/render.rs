@@ -18,7 +18,9 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::timeline::{Canvas, Clip, ClipKind, SubtitleExport, Timeline, TrackKind, TransitionKind};
+use crate::timeline::{
+    Anim, Canvas, Clip, ClipKind, Motion, Side, SubtitleExport, TextPlace, Timeline, TrackKind, TransitionKind,
+};
 use crate::{Error, Result};
 
 /// Sample rate of all sound before mixing, and of the preview's sound.
@@ -102,10 +104,144 @@ fn pieces<'a>(t: &'a Timeline, o: &RenderOpts) -> Vec<Piece<'a>> {
 const PREROLL: Duration = Duration::from_millis(500);
 
 fn preroll(p: &Piece) -> Duration {
-    match p.clip.kind {
-        ClipKind::Image => Duration::ZERO,
-        _ => PREROLL.min(p.clip.in_point + p.tau0),
+    if p.clip.is_still() {
+        Duration::ZERO
+    } else {
+        PREROLL.min(p.clip.in_point + p.clip.source_span(p.tau0))
     }
+}
+
+/// `[a, b]` with ffmpeg's number formatting.
+fn num(v: f64) -> String {
+    let s = format!("{v:.6}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" { "0".into() } else { s.into() }
+}
+
+/// atempo takes 0.5 to 100 at a time: slower speeds are a chain.
+fn atempo(speed: f64) -> String {
+    let mut parts = Vec::new();
+    let mut s = speed;
+    while s < 0.5 {
+        parts.push("atempo=0.5".to_string());
+        s /= 0.5;
+    }
+    parts.push(format!("atempo={}", num(s)));
+    parts.join(",")
+}
+
+/// How a clip's picture moves, as ffmpeg expressions of its own time τ.
+#[derive(Debug, Default, PartialEq)]
+struct Moves {
+    /// Size factor (1 = as is).
+    zoom: Vec<String>,
+    /// Pixels right / down.
+    dx: Vec<String>,
+    dy: Vec<String>,
+    /// Radians clockwise.
+    angle: Vec<String>,
+}
+
+impl Moves {
+    fn is_empty(&self) -> bool {
+        self.zoom.is_empty() && self.dx.is_empty() && self.dy.is_empty() && self.angle.is_empty()
+    }
+}
+
+fn product(f: &[String]) -> String {
+    f.iter().map(|x| format!("({x})")).collect::<Vec<_>>().join("*")
+}
+
+fn sum(f: &[String]) -> String {
+    f.iter().map(|x| format!("({x})")).collect::<Vec<_>>().join("+")
+}
+
+/// The clip's effects for a `w`x`h` frame, with `tau` standing for the
+/// clip's own time in seconds.
+fn moves(clip: &Clip, w: u32, h: u32, tau: &str) -> Moves {
+    let e = &clip.effects;
+    let mut m = Moves::default();
+    let (w, h) = (w as f64, h as f64);
+    let len = clip.len().as_secs_f64().max(0.001);
+    let t = tau;
+    // 0 → 1 over the clip.
+    let along = format!("clip({t}/{},0,1)", num(len));
+    if let Some(motion) = e.motion {
+        match motion {
+            Motion::ZoomIn => m.zoom.push(format!("1+0.2*{along}")),
+            Motion::ZoomOut => m.zoom.push(format!("1.2-0.2*{along}")),
+            Motion::PanLeft | Motion::PanRight => {
+                // Zoomed in just enough to slide 7% of the width each way
+                // without an edge showing.
+                m.zoom.push("1.15".into());
+                let sign = if motion == Motion::PanLeft { "" } else { "-" };
+                m.dx.push(format!("{sign}{}*(1-2*{along})", num(w * 0.07)));
+            }
+            Motion::Pulse => m.zoom.push(format!("1+0.03*(1-cos(2*PI*{t}))")),
+            Motion::Bounce => m.dy.push(format!("-{}*abs(sin(PI*{t}/0.7))", num(h * 0.06))),
+            Motion::Float => m.dy.push(format!("{}*sin(2*PI*{t}/3)", num(h * 0.02))),
+            Motion::Shake => {
+                m.dx.push(format!("{}*sin({t}*53)", num(w * 0.012)));
+                m.dy.push(format!("{}*sin({t}*41+1.3)", num(h * 0.012)));
+            }
+            Motion::Wobble => m.angle.push(format!("0.06*sin(2*PI*{t}/1.5)")),
+            Motion::Spin => m.angle.push(format!("PI*{t}/2")),
+        }
+    }
+    // An entrance's `amount` goes 1 → 0 (easing out), an exit's 0 → 1
+    // (easing in). Spinning in turns one way, spinning out the other.
+    let mut anim = |a: Anim, amount: String, turn: &str| match a {
+        Anim::Slide(side) => match side {
+            Side::Left => m.dx.push(format!("-{}*{amount}", num(w))),
+            Side::Right => m.dx.push(format!("{}*{amount}", num(w))),
+            Side::Top => m.dy.push(format!("-{}*{amount}", num(h))),
+            Side::Bottom => m.dy.push(format!("{}*{amount}", num(h))),
+        },
+        Anim::Zoom => m.zoom.push(format!("max(0.01,1-{amount})")),
+        Anim::Spin => {
+            m.zoom.push(format!("max(0.01,1-{amount})"));
+            m.angle.push(format!("{turn}2*PI*{amount}"));
+        }
+    };
+    let d_in = e.enter_len.as_secs_f64().clamp(0.05, len);
+    let d_out = e.exit_len.as_secs_f64().clamp(0.05, len);
+    if let Some(a) = e.enter {
+        anim(a, format!("pow(1-clip({t}/{},0,1),3)", num(d_in)), "-");
+    }
+    if let Some(a) = e.exit {
+        anim(a, format!("pow(clip(({t}-{})/{},0,1),3)", num(len - d_out), num(d_out)), "");
+    }
+    m
+}
+
+/// A drawtext filter for `style` on a `w`x`h` frame.
+fn drawtext(style: &crate::timeline::TextStyle, w: u32, h: u32) -> String {
+    let size = ((h as f32 * style.size.clamp(0.02, 0.3)).round() as u32).max(6);
+    let [r, g, b] = style.color;
+    let margin = (h / 12).max(4);
+    let y = match style.place {
+        TextPlace::Top => format!("{margin}"),
+        TextPlace::Middle => "(h-th)/2".into(),
+        TextPlace::Bottom => format!("h-th-{margin}"),
+    };
+    let mut f = format!(
+        "drawtext=text={}:expansion=none:fontsize={size}:fontcolor=0x{r:02x}{g:02x}{b:02x}:line_spacing={}:\
+         x=(w-tw)/2:y={y}:shadowcolor=black@0.6:shadowx={s}:shadowy={s}",
+        escape_text(&style.text),
+        size / 5,
+        s = (size / 20).max(1),
+    );
+    if style.boxed {
+        f += &format!(":box=1:boxcolor=black@0.55:boxborderw={}", (size / 3).max(2));
+    }
+    let _ = w;
+    f
+}
+
+/// drawtext's text, escaped for its own options and then for the graph.
+fn escape_text(s: &str) -> String {
+    use crate::subtitles::escape_chars;
+    escape_chars(&escape_chars(s, &['\\', '\'', ':']), &['\\', '\'', '[', ']', ',', ';'])
 }
 
 fn secs(d: Duration) -> String {
@@ -195,46 +331,108 @@ pub fn render_graph(t: &Timeline, o: &RenderOpts) -> (Vec<OsString>, String) {
     let mut overlays = Vec::new();
     let mut mixes = Vec::new();
 
+    // Inputs are numbered apart from pieces: text clips have none.
+    let mut next_input = 0usize;
     for (n, p) in pieces.iter().enumerate() {
-        if let Some(threads) = o.input_threads {
-            inputs.extend(["-threads".into(), threads.to_string().into()]);
-        }
-        match p.clip.kind {
-            // A picture is decoded once and repeated in the graph (looping
-            // the input would decode it again for every frame).
-            ClipKind::Image => {}
-            ClipKind::Video | ClipKind::Audio => {
-                let from = p.clip.in_point + p.tau0;
+        let clip = p.clip;
+        let speed = clip.speed();
+        let input = clip.has_file().then(|| {
+            if let Some(threads) = o.input_threads {
+                inputs.extend(["-threads".into(), threads.to_string().into()]);
+            }
+            if !clip.is_still() {
+                let from = clip.in_point + clip.source_span(p.tau0);
                 if !from.is_zero() {
                     inputs.extend(["-ss".into(), secs(from - preroll(p)).into()]);
                 }
-                inputs.extend(["-t".into(), secs(p.len + preroll(p)).into()]);
+                inputs.extend(["-t".into(), secs(clip.source_span(p.len) + preroll(p)).into()]);
             }
-        }
-        inputs.extend(crate::input::args(&p.clip.path));
+            // Only what's used is read: a video on an audio track gives its
+            // sound and its picture is never decoded.
+            if !p.picture {
+                inputs.push("-vn".into());
+            }
+            if !p.sound {
+                inputs.push("-an".into());
+            }
+            inputs.extend(["-sn".into(), "-dn".into()]);
+            inputs.extend(crate::input::args(&clip.path));
+            next_input += 1;
+            next_input - 1
+        });
 
         if p.picture {
             let upper = p.layer > 0;
             let fades = picture_fades(p, upper);
-            let alpha = upper || fades.iter().any(|(_, a)| *a);
+            let moves = moves(clip, w, h, "t");
+            let opacity = clip.opacity.clamp(0.0, 1.0);
+            let alpha = upper || fades.iter().any(|(_, a)| *a) || !moves.is_empty() || opacity < 1.0;
             let (pad, fmt) = if upper { ("black@0", "yuva420p") } else if alpha { ("black", "yuva420p") } else { ("black", "yuv420p") };
-            let mut v = format!("[{n}:v:0]");
+            let mut v = match (input, &clip.text) {
+                (Some(i), _) => format!("[{i}:v:0]"),
+                // Text: drawn once on a clear frame, repeated like a picture.
+                (None, Some(style)) => format!("color=c=black@0:s={w}x{h}:r=1:d=1,format=yuva420p,{},", drawtext(style, w, h)),
+                (None, None) => format!("color=c=black@0:s={w}x{h}:r=1:d=1,format=yuva420p,"),
+            };
             if !preroll(p).is_zero() {
                 v += &format!("trim=start={},", secs(preroll(p)));
             }
-            v += &format!(
-                "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2,\
-                 pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={pad},setsar=1,format={fmt},"
-            );
-            if p.clip.kind == ClipKind::Image {
+            let crop = clip.crop.clamped();
+            if !crop.is_none() && clip.has_file() {
+                let (cw, ch) = (1.0 - crop.left - crop.right, 1.0 - crop.top - crop.bottom);
+                v += &format!(
+                    "crop=w=iw*{}:h=ih*{}:x=iw*{}:y=ih*{},",
+                    num(cw as f64),
+                    num(ch as f64),
+                    num(crop.left as f64),
+                    num(crop.top as f64)
+                );
+            }
+            let tr = clip.transform;
+            v += match tr.rotate {
+                90 => "transpose=clock,",
+                180 => "hflip,vflip,",
+                270 => "transpose=cclock,",
+                _ => "",
+            };
+            if tr.flip_h {
+                v += "hflip,";
+            }
+            if tr.flip_v {
+                v += "vflip,";
+            }
+            if clip.has_file() {
+                v += &format!(
+                    "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2,\
+                     pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={pad},setsar=1,"
+                );
+            }
+            v += &format!("format={fmt},");
+            if clip.is_still() {
                 v += &format!("loop=loop=-1:size=1,setpts=N/({fps})/TB,trim=duration={},", secs(p.len));
             }
-            v += &format!("setpts=PTS-STARTPTS+{}/TB", secs(p.tau0));
+            if speed == 1.0 {
+                v += &format!("setpts=PTS-STARTPTS+{}/TB", secs(p.tau0));
+            } else {
+                v += &format!("setpts=(PTS-STARTPTS)/{}+{}/TB", num(speed), secs(p.tau0));
+            }
             for ((dir, st, d), to_alpha) in &fades {
                 v += &format!(",fade=t={}:st={}:d={}", fade_name(*dir), secs(*st), secs(*d));
                 if *to_alpha {
                     v += ":alpha=1";
                 }
+            }
+            // Turning and resizing happen here, in the clip's own time;
+            // moving happens where it's laid over the frame.
+            if !moves.angle.is_empty() {
+                v += &format!(",rotate=a='{}':c=none:ow=iw:oh=ih", sum(&moves.angle));
+            }
+            if !moves.zoom.is_empty() {
+                let z = product(&moves.zoom);
+                v += &format!(",scale=w='max(2,trunc(iw*{z}/2)*2)':h='max(2,trunc(ih*{z}/2)*2)':eval=frame");
+            }
+            if opacity < 1.0 {
+                v += &format!(",lut=a='val*{}'", num(opacity as f64));
             }
             v += &format!(",setpts=PTS-STARTPTS+{}/TB", secs(p.at));
             graph.push(format!("{v}[pv{n}]"));
@@ -243,20 +441,33 @@ pub fn render_graph(t: &Timeline, o: &RenderOpts) -> (Vec<OsString>, String) {
                 TransitionKind::DipToBlack if !p.ov_in.is_zero() => (p.ov_in / 2).saturating_sub(p.tau0),
                 _ => Duration::ZERO,
             };
-            overlays.push((n, p.at + hidden_until, p.at + p.len));
+            // Where it's laid: in the overlay, t is the render's time, so
+            // the clip's own time is t minus where its start would be.
+            let place = (!moves.is_empty()).then(|| {
+                let offset = p.at.as_secs_f64() - p.tau0.as_secs_f64();
+                let tau = format!("(t-({}))", num(offset));
+                let m = self::moves(clip, w, h, &tau);
+                let shift = |v: &[String]| if v.is_empty() { String::new() } else { format!("+{}", sum(v)) };
+                (format!("(main_w-overlay_w)/2{}", shift(&m.dx)), format!("(main_h-overlay_h)/2{}", shift(&m.dy)))
+            });
+            overlays.push((n, p.at + hidden_until, p.at + p.len, place));
         }
 
-        if p.sound {
-            let mut a = format!("[{n}:a:0]");
+        if let (true, Some(i)) = (p.sound, input) {
+            let mut a = format!("[{i}:a:0]");
             if !preroll(p).is_zero() {
                 a += &format!("atrim=start={},", secs(preroll(p)));
             }
+            a += "asetpts=PTS-STARTPTS,";
+            if speed != 1.0 {
+                a += &format!("{},atrim=duration={},", atempo(speed), secs(p.len));
+            }
             a += &format!(
-                "asetpts=PTS-STARTPTS,aresample={SAMPLE_RATE},\
+                "aresample={SAMPLE_RATE},\
                  aformat=sample_fmts=fltp:sample_rates={SAMPLE_RATE}:channel_layouts=stereo,\
                  asetpts=PTS-STARTPTS+{}/TB,volume={:.3}",
                 secs(p.tau0),
-                p.clip.volume.clamp(0.0, crate::audio::MAX_VOLUME)
+                clip.volume.clamp(0.0, crate::audio::MAX_VOLUME)
             );
             for (dir, st, d) in sound_fades(p) {
                 a += &format!(",afade=t={}:st={}:d={}", fade_name(dir), secs(st), secs(d));
@@ -274,9 +485,13 @@ pub fn render_graph(t: &Timeline, o: &RenderOpts) -> (Vec<OsString>, String) {
     if o.video {
         graph.push(format!("color=c=black:s={w}x{h}:r={fps}:d={},format=yuv420p[base]", secs(span.max(Duration::from_millis(1)))));
         let mut last = "base".to_string();
-        for (k, (n, from, to)) in overlays.iter().enumerate() {
+        for (k, (n, from, to, place)) in overlays.iter().enumerate() {
+            let xy = match place {
+                Some((x, y)) => format!("x='{x}':y='{y}':"),
+                None => String::new(),
+            };
             graph.push(format!(
-                "[{last}][pv{n}]overlay=eof_action=pass:enable='between(t,{},{})'[ov{k}]",
+                "[{last}][pv{n}]overlay={xy}eof_action=pass:enable='between(t,{},{})'[ov{k}]",
                 secs(*from),
                 secs(to.saturating_sub(Duration::from_micros(1)))
             ));
@@ -309,6 +524,14 @@ pub enum ExportFormat {
     Mp4,
     /// VP9 video, Opus sound.
     WebM,
+    /// Sound only: no picture is rendered or written at all.
+    /// AAC in an .m4a.
+    M4a,
+    Mp3,
+    /// Opus in an .opus or .ogg.
+    Opus,
+    Flac,
+    Wav,
 }
 
 impl ExportFormat {
@@ -316,6 +539,11 @@ impl ExportFormat {
         match self {
             Self::Mp4 => "mp4",
             Self::WebM => "webm",
+            Self::M4a => "m4a",
+            Self::Mp3 => "mp3",
+            Self::Opus => "opus",
+            Self::Flac => "flac",
+            Self::Wav => "wav",
         }
     }
 
@@ -323,8 +551,18 @@ impl ExportFormat {
         match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
             "mp4" | "m4v" | "mov" | "mkv" => Some(Self::Mp4),
             "webm" => Some(Self::WebM),
+            "m4a" => Some(Self::M4a),
+            "mp3" => Some(Self::Mp3),
+            "opus" | "ogg" | "oga" => Some(Self::Opus),
+            "flac" => Some(Self::Flac),
+            "wav" => Some(Self::Wav),
             _ => None,
         }
+    }
+
+    /// Sound only.
+    pub fn is_audio(self) -> bool {
+        !matches!(self, Self::Mp4 | Self::WebM)
     }
 }
 
@@ -389,6 +627,9 @@ fn ext(p: &Path) -> String {
 
 /// Full ffmpeg argument list for an export.
 pub fn export_args(req: &ExportRequest) -> Vec<OsString> {
+    if req.format.is_audio() {
+        return export_audio_args(req);
+    }
     let t = &req.timeline;
     let opts = RenderOpts {
         canvas: req.canvas,
@@ -437,7 +678,7 @@ pub fn export_args(req: &ExportRequest) -> Vec<OsString> {
             a.extend(strs(&["-c:v", "libx264", "-crf", &crf, "-preset", &req.preset, "-pix_fmt", "yuv420p"]));
             a.extend(strs(&["-c:a", "aac", "-b:a", "192k"]));
         }
-        ExportFormat::WebM => {
+        _ => {
             a.extend(strs(&["-c:v", "libvpx-vp9", "-crf", &crf, "-b:v", "0", "-row-mt", "1"]));
             a.extend(strs(&["-deadline", "good", "-cpu-used", "4", "-pix_fmt", "yuv420p"]));
             a.extend(strs(&["-c:a", "libopus", "-b:a", "128k"]));
@@ -448,6 +689,42 @@ pub fn export_args(req: &ExportRequest) -> Vec<OsString> {
         a.extend(strs(&["-metadata", "creation_time=now"]));
     }
     if crate::privacy::is_mp4_family(&req.output) {
+        a.extend(strs(&["-movflags", "+faststart"]));
+    }
+    a.push(req.output.clone().into());
+    a
+}
+
+/// An export of the sound alone: no picture is decoded or written, and
+/// videos on the timeline give only their sound.
+fn export_audio_args(req: &ExportRequest) -> Vec<OsString> {
+    let t = &req.timeline;
+    let opts = RenderOpts {
+        canvas: req.canvas,
+        from: Duration::ZERO,
+        to: t.duration(),
+        video: false,
+        audio: true,
+        input_threads: None,
+    };
+    let (inputs, graph) = render_graph(t, &opts);
+    let mut a = strs(&["-y", "-hide_banner", "-nostdin", "-progress", "pipe:1", "-nostats"]);
+    a.extend(inputs);
+    a.push("-filter_complex".into());
+    a.push(graph.into());
+    a.extend(strs(&["-map", "[aout]", "-vn", "-sn", "-dn"]));
+    match req.format {
+        ExportFormat::M4a => a.extend(strs(&["-c:a", "aac", "-b:a", "192k"])),
+        ExportFormat::Mp3 => a.extend(strs(&["-c:a", "libmp3lame", "-q:a", "2", "-id3v2_version", "0"])),
+        ExportFormat::Opus => a.extend(strs(&["-c:a", "libopus", "-b:a", "128k"])),
+        ExportFormat::Flac => a.extend(strs(&["-c:a", "flac"])),
+        _ => a.extend(strs(&["-c:a", "pcm_s16le"])),
+    }
+    a.extend(crate::privacy::output_args(req.keep_tags, true, false));
+    if req.keep_tags {
+        a.extend(strs(&["-metadata", "creation_time=now"]));
+    }
+    if req.format == ExportFormat::M4a {
         a.extend(strs(&["-movflags", "+faststart"]));
     }
     a.push(req.output.clone().into());
@@ -544,10 +821,10 @@ mod tests {
         let t = project();
         let (inputs, g) = render_graph(&t, &whole(&t));
         let i = join(&inputs);
-        assert!(i.contains("-t 10.000000 -protocol_whitelist file -i file:a.mp4"), "{i}");
-        assert!(i.contains("-t 10.000000 -protocol_whitelist file -i file:a.mp4 -protocol_whitelist file -i file:b.png"), "{i}");
+        assert!(i.contains("-t 10.000000 -sn -dn -protocol_whitelist file -i file:a.mp4"), "{i}");
+        assert!(i.contains("-t 10.000000 -sn -dn -protocol_whitelist file -i file:a.mp4 -an -sn -dn -protocol_whitelist file -i file:b.png"), "{i}");
         assert!(g.contains("format=yuv420p,loop=loop=-1:size=1,setpts=N/(30)/TB,trim=duration=4.000000,setpts"), "{g}");
-        assert!(i.contains("-t 30.000000 -protocol_whitelist file -i file:m.mp3"), "{i}");
+        assert!(i.contains("-t 30.000000 -vn -sn -dn -protocol_whitelist file -i file:m.mp3"), "{i}");
         assert!(g.contains("color=c=black:s=1280x720:r=30:d=32.000000"), "{g}");
         assert!(g.contains("setpts=PTS-STARTPTS+10.000000/TB[pv1]"), "{g}");
         assert!(g.contains("[ov0][pv1]overlay=eof_action=pass:enable='between(t,10.000000,13.999999)'[ov1]"), "{g}");
@@ -605,10 +882,10 @@ mod tests {
         let o = RenderOpts { from: s(8), to: s(12), ..whole(&t) };
         let (inputs, g) = render_graph(&t, &o);
         let i = join(&inputs);
-        assert!(i.contains("-ss 7.500000 -t 2.500000 -protocol_whitelist file -i file:a.mp4"), "{i}");
+        assert!(i.contains("-ss 7.500000 -t 2.500000 -sn -dn -protocol_whitelist file -i file:a.mp4"), "{i}");
         assert!(g.contains("[0:v:0]trim=start=0.500000,scale="), "{g}");
         assert!(g.contains("trim=duration=2.000000,setpts=PTS-STARTPTS+0.000000/TB"), "{g}");
-        assert!(i.contains("-ss 5.500000 -t 4.500000 -protocol_whitelist file -i file:m.mp3"), "{i}");
+        assert!(i.contains("-ss 5.500000 -t 4.500000 -vn -sn -dn -protocol_whitelist file -i file:m.mp3"), "{i}");
         assert!(g.contains("[2:a:0]atrim=start=0.500000,asetpts=PTS-STARTPTS"), "{g}");
         assert!(!i.contains("c.mp4"), "{i}");
         // a's fade-out still runs from 6s in a's time.
@@ -698,12 +975,100 @@ mod tests {
         t.subtitle = Some("s.srt".into());
         let p = PreviewOpts { canvas: Canvas { width: 640, height: 360, fps: 25.0 }, from: s(2), to: s(4), subtitles: true, single_frame: true };
         let a = join(&preview_video_args(&t, &p));
-        assert!(a.contains("-threads 1 -ss 1.500000 -t 2.500000 -protocol_whitelist file -i file:a.mp4"), "{a}");
+        assert!(a.contains("-threads 1 -ss 1.500000 -t 2.500000 -an -sn -dn -protocol_whitelist file -i file:a.mp4"), "{a}");
         assert!(a.contains(r"setpts=PTS+2.000000/TB,subtitles=filename=file\\:s.srt[vout]"), "{a}");
         assert!(a.contains("-frames:v 1 -f image2pipe"), "{a}");
         assert!(!a.contains("m.mp3"), "no sound inputs for the picture: {a}");
         let a = join(&preview_audio_args(&t, &p));
         assert!(a.contains("-map [aout] -f s16le"), "{a}");
         assert!(!a.contains("b.png") && !a.contains("[vout]"), "{a}");
+    }
+
+    #[test]
+    fn flips_crop_opacity_and_speed() {
+        let mut t = project();
+        let v1 = |i| ClipRef { track: TrackRef::V1, index: i };
+        let a = t.clip_mut(v1(0)).unwrap();
+        a.transform = crate::timeline::Transform::default().rotated_cw().flipped_h();
+        a.crop = crate::timeline::Crop { left: 0.1, right: 0.2, top: 0.0, bottom: 0.25 };
+        a.opacity = 0.5;
+        t.set_speed(v1(0), 2.0);
+        let (inputs, g) = render_graph(&t, &whole(&t));
+        // 5s of timeline is all 10s of the source.
+        assert!(join(&inputs).contains("-t 10.000000 -sn -dn -protocol_whitelist file -i file:a.mp4"), "{}", join(&inputs));
+        assert!(
+            g.contains("[0:v:0]crop=w=iw*0.7:h=ih*0.75:x=iw*0.1:y=ih*0,transpose=clock,hflip,scale=1280:720"),
+            "{g}"
+        );
+        assert!(g.contains("format=yuva420p,setpts=(PTS-STARTPTS)/2+0.000000/TB,lut=a='val*0.5',setpts"), "{g}");
+        assert!(g.contains("[0:a:0]asetpts=PTS-STARTPTS,atempo=2,atrim=duration=5.000000,aresample"), "{g}");
+        assert_eq!(atempo(0.25), "atempo=0.5,atempo=0.5");
+        assert_eq!(atempo(0.3), "atempo=0.5,atempo=0.6");
+    }
+
+    #[test]
+    fn effects_move_the_picture_in_its_own_time() {
+        use crate::timeline::{Anim, Effects, Motion, Side};
+        let mut t = project();
+        // The picture (10-14): Ken Burns, sliding in from the left, spinning out.
+        t.video[0].clips[1].effects = Effects {
+            motion: Some(Motion::ZoomIn),
+            enter: Some(Anim::Slide(Side::Left)),
+            exit: Some(Anim::Spin),
+            ..Effects::default()
+        };
+        let (_, g) = render_graph(&t, &whole(&t));
+        // Turning and sizing run on the clip's own clock (t = τ there)…
+        assert!(g.contains(",rotate=a='(2*PI*pow(clip((t-3.4)/0.6,0,1),3))':c=none:ow=iw:oh=ih"), "{g}");
+        assert!(g.contains(",scale=w='max(2,trunc(iw*(1+0.2*clip(t/4,0,1))*(max(0.01,1-pow(clip((t-3.4)/0.6,0,1),3)))/2)*2)'"), "{g}");
+        // …the slide where it's laid over the frame, on the render's clock
+        // shifted to the clip's: τ = t - 10.
+        assert!(g.contains("[ov0][pv1]overlay=x='(main_w-overlay_w)/2+(-1280*pow(1-clip((t-(10))/0.6,0,1),3))':y='(main_h-overlay_h)/2':eof_action"), "{g}");
+        // On V1 it needs transparency for the black to show around it.
+        assert!(g.contains("color=black,setsar=1,format=yuva420p,loop"), "{g}");
+        // A stretch starting 2s into the picture keeps the same clock.
+        let o = RenderOpts { from: s(12), to: s(13), ..whole(&t) };
+        let (_, g) = render_graph(&t, &o);
+        assert!(g.contains("setpts=PTS-STARTPTS+2.000000/TB,rotate"), "{g}");
+        assert!(g.contains("overlay=x='(main_w-overlay_w)/2+(-1280*pow(1-clip((t-(-2))/0.6,0,1),3))'"), "{g}");
+        // Every motion makes an expression.
+        for m in Motion::ALL {
+            t.video[0].clips[1].effects = Effects { motion: Some(m), ..Effects::default() };
+            assert!(!moves(&t.video[0].clips[1], 1280, 720, "t").is_empty(), "{m:?}");
+        }
+    }
+
+    #[test]
+    fn text_is_drawn_without_an_input() {
+        use crate::timeline::{TextPlace, TextStyle};
+        let mut t = project();
+        let v2 = t.add_track(TrackKind::Video);
+        let style = TextStyle { text: "It's 50%: [a, b]; c\\".into(), place: TextPlace::Bottom, boxed: true, color: [255, 204, 0], ..TextStyle::default() };
+        t.add_clip(v2, Clip::text(style), s(1)).unwrap();
+        let (inputs, g) = render_graph(&t, &whole(&t));
+        assert_eq!(join(&inputs).matches(" -i ").count(), 4, "{}", join(&inputs));
+        assert!(g.contains(r"color=c=black@0:s=1280x720:r=1:d=1,format=yuva420p,drawtext=text=It\\\'s 50%\\: \[a\, b\]\; c\\\\:expansion=none:fontsize=58:fontcolor=0xffcc00"), "{g}");
+        assert!(g.contains(":y=h-th-60:") && g.contains(":box=1:"), "{g}");
+        // The music is still input 3, the text piece 4.
+        assert!(g.contains("[3:a:0]") && g.contains("[pv4]"), "{g}");
+        assert!(!g.contains("[4:v:0]"), "{g}");
+    }
+
+    #[test]
+    fn videos_on_audio_tracks_give_sound_only() {
+        let mut t = Timeline::default();
+        t.append(TrackRef::A1, Clip::video("talk.mp4".into(), s(3), true)).unwrap();
+        let (inputs, g) = render_graph(&t, &whole(&t));
+        assert!(join(&inputs).contains("-vn -sn -dn -protocol_whitelist file -i file:talk.mp4"), "{}", join(&inputs));
+        assert!(!g.contains("[0:v:0]") && g.contains("[0:a:0]"), "{g}");
+        // Exported as sound alone, nothing about a picture is in the command.
+        let a = join(&export_args(&ExportRequest::new(t, "talk.m4a".into())));
+        assert!(a.contains("-map [aout] -vn -sn -dn -c:a aac"), "{a}");
+        assert!(!a.contains("[vout]") && !a.contains("libx264") && !a.contains("color=c=black"), "{a}");
+        for (name, codec) in [("x.mp3", "libmp3lame"), ("x.ogg", "libopus"), ("x.flac", "flac"), ("x.wav", "pcm_s16le")] {
+            let req = ExportRequest::new(project(), name.into());
+            assert!(req.format.is_audio());
+            assert!(join(&export_args(&req)).contains(&format!("-c:a {codec}")), "{name}");
+        }
     }
 }

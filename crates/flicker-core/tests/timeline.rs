@@ -475,3 +475,180 @@ fn a_project_never_makes_ffmpeg_connect_out() {
     assert!(listener.accept().is_err(), "ffmpeg connected to {url}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A 320x160 picture: red on the left half, blue on the right.
+fn halves(dir: &Path) -> PathBuf {
+    let p = dir.join("halves.png");
+    ffmpeg(
+        &["-f", "lavfi", "-i", "color=c=red:size=160x160", "-f", "lavfi", "-i", "color=c=blue:size=160x160",
+          "-filter_complex", "[0][1]hstack", "-frames:v", "1"],
+        &p,
+    );
+    p
+}
+
+/// The preview's frame at `at` (160x120), as RGB at (x, y).
+fn pixel_at(t: &Timeline, at: Duration, x: usize, y: usize) -> [u8; 3] {
+    let mut one = FfmpegCli::locate().open_timeline_frames(&preview(t, at, true)).unwrap();
+    let f = one.next_frame().unwrap().unwrap();
+    let i = (y * f.width as usize + x) * 3;
+    [f.rgb[i], f.rgb[i + 1], f.rgb[i + 2]]
+}
+
+fn is_red(p: [u8; 3]) -> bool {
+    p[0] > 180 && p[1] < 70 && p[2] < 70
+}
+
+fn is_blue(p: [u8; 3]) -> bool {
+    p[2] > 180 && p[0] < 70 && p[1] < 70
+}
+
+fn is_black(p: [u8; 3]) -> bool {
+    p.iter().all(|&c| c < 30)
+}
+
+#[test]
+fn preview_shows_flips_turns_crop_opacity_and_effects() {
+    use flicker_core::timeline::{Anim, Crop, Effects, Motion, Side, Transform};
+    let Some(dir) = workdir("looks") else { return };
+    let mut t = Timeline::default();
+    let mut pic = Clip::image(halves(&dir));
+    (pic.width, pic.height) = (Some(320), Some(160));
+    t.append(TrackRef::V1, pic).unwrap();
+    let c = ClipRef { track: TrackRef::V1, index: 0 };
+    let at = Duration::from_millis(2_000);
+    // Letterboxed 160x80 in the 160x120 frame: red left, blue right.
+    assert!(is_red(pixel_at(&t, at, 20, 60)) && is_blue(pixel_at(&t, at, 140, 60)));
+
+    t.clip_mut(c).unwrap().transform = Transform::default().flipped_h();
+    assert!(is_blue(pixel_at(&t, at, 20, 60)) && is_red(pixel_at(&t, at, 140, 60)), "mirrored");
+    t.clip_mut(c).unwrap().transform = Transform::default().flipped_v();
+    assert!(is_red(pixel_at(&t, at, 20, 60)), "top-bottom mirroring keeps the sides");
+    // A quarter turn clockwise: the left (red) half goes on top, and it's
+    // pillarboxed 60x120 in the middle.
+    t.clip_mut(c).unwrap().transform = Transform::default().rotated_cw();
+    assert!(is_red(pixel_at(&t, at, 80, 10)) && is_blue(pixel_at(&t, at, 80, 110)), "turned");
+    assert!(is_black(pixel_at(&t, at, 10, 60)), "bars beside it");
+    t.clip_mut(c).unwrap().transform = Transform::default().rotated_ccw();
+    assert!(is_blue(pixel_at(&t, at, 80, 10)) && is_red(pixel_at(&t, at, 80, 110)), "turned back");
+    t.clip_mut(c).unwrap().transform = Transform::default();
+
+    // Cropping off the left 60% leaves mostly blue.
+    t.clip_mut(c).unwrap().crop = Crop { left: 0.45, ..Crop::default() };
+    assert!(is_blue(pixel_at(&t, at, 120, 60)), "{:?}", pixel_at(&t, at, 120, 60));
+    t.clip_mut(c).unwrap().crop = Crop::default();
+
+    // Half see-through over black: half as bright.
+    t.clip_mut(c).unwrap().opacity = 0.5;
+    let p = pixel_at(&t, at, 20, 60);
+    assert!((100..160).contains(&p[0]) && p[1] < 40, "{p:?}");
+    t.clip_mut(c).unwrap().opacity = 1.0;
+
+    // Sliding in from the left: off the frame at first, in place after.
+    let k = t.clip_mut(c).unwrap();
+    k.effects = Effects { enter: Some(Anim::Slide(Side::Left)), exit: Some(Anim::Zoom), ..Effects::default() };
+    assert!(is_black(pixel_at(&t, Duration::ZERO, 140, 60)), "{:?}", pixel_at(&t, Duration::ZERO, 140, 60));
+    assert!(is_blue(pixel_at(&t, Duration::from_millis(1_000), 140, 60)));
+    // Shrinking away at the end: nearly gone in the last frame.
+    assert!(is_black(pixel_at(&t, Duration::from_millis(3_950), 20, 60)));
+    // Zooming in (Ken Burns): by the end the red reaches further right.
+    t.clip_mut(c).unwrap().effects = Effects { motion: Some(Motion::ZoomIn), ..Effects::default() };
+    assert!(is_blue(pixel_at(&t, Duration::ZERO, 88, 60)));
+    assert!(is_red(pixel_at(&t, Duration::from_millis(3_900), 76, 60)));
+    assert!(is_red(pixel_at(&t, Duration::from_millis(3_900), 20, 25)), "the red grows past the bar");
+}
+
+#[test]
+fn text_speed_and_effects_render_in_an_export() {
+    use flicker_core::timeline::{Anim, Effects, Motion, Side, TextPlace, TextStyle, Transform};
+    let Some(dir) = workdir("fx") else { return };
+    let (a, b, img, music) = sources(&dir);
+    let mut t = timeline(&a, &b, &img, &music);
+    let v1 = |i| ClipRef { track: TrackRef::V1, index: i };
+    // a at double speed: 2s. The picture turned and spinning, b bouncing.
+    assert!(t.set_speed(v1(0), 2.0));
+    let pic = t.clip_mut(v1(1)).unwrap();
+    pic.transform = Transform::default().rotated_cw().flipped_h();
+    pic.effects = Effects { motion: Some(Motion::Spin), enter: Some(Anim::Slide(Side::Top)), ..Effects::default() };
+    let bars = t.clip_mut(v1(2)).unwrap();
+    bars.effects = Effects { motion: Some(Motion::Bounce), exit: Some(Anim::Spin), ..Effects::default() };
+    bars.opacity = 0.7;
+    bars.crop = flicker_core::timeline::Crop { left: 0.2, top: 0.1, ..Default::default() };
+    // A title over it all, with every character the graph treats specially.
+    let v2 = t.add_track(TrackKind::Video);
+    let style = TextStyle {
+        text: "Flicker's \"test\": 100% [ok], a;b \\ c\nline two".into(),
+        place: TextPlace::Top,
+        boxed: true,
+        ..TextStyle::default()
+    };
+    let mut title = Clip::text(style);
+    title.effects = Effects { motion: Some(Motion::Pulse), enter: Some(Anim::Zoom), ..Effects::default() };
+    t.add_clip(v2, title, Duration::from_millis(500)).unwrap();
+    // a takes 2s now, leaving a 2s gap before the picture (4-6) and b (6-9).
+    assert_eq!(t.duration(), s(9));
+
+    let out = dir.join("fx.mp4");
+    let mut req = ExportRequest::new(t.clone(), out.clone());
+    req.preset = "ultrafast".into();
+    export(&req);
+    let info = FfmpegCli::locate().probe(&out).unwrap();
+    assert_close(info.duration.unwrap(), s(9));
+    // Every frame decodes cleanly.
+    let check = Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&out).args(["-f", "null", "-"]).output().unwrap();
+    assert!(check.status.success() && check.stderr.is_empty(), "{}", String::from_utf8_lossy(&check.stderr));
+    // a's tone is in the first two seconds (played twice as fast).
+    let p = pcm(&out);
+    assert!(rms(&p, 8000.0, 0.1, 0.9) > 500.0, "a's sound at double speed");
+
+    // The text is drawn: bright pixels near the top while it's on.
+    let mut one = FfmpegCli::locate().open_timeline_frames(&preview(&t, s(2), true)).unwrap();
+    let f = one.next_frame().unwrap().unwrap();
+    let top = &f.rgb[..(f.width * 30 * 3) as usize];
+    assert!(top.chunks(3).filter(|p| p.iter().all(|&c| c > 220)).count() > 20, "no text drawn");
+}
+
+#[test]
+fn a_video_on_an_audio_track_is_only_its_sound() {
+    let Some(dir) = workdir("vsnd") else { return };
+    let (a, _b, img, _music) = sources(&dir);
+    let mut t = Timeline::default();
+    let mut pic = Clip::image(img.clone());
+    pic.out_point = s(4);
+    t.append(TrackRef::V1, pic).unwrap();
+    // a.mp4 (test pattern + 440 Hz tone) dropped on A1.
+    t.append(TrackRef::A1, clip(&a)).unwrap();
+    // In a video export the picture stays the red still: a's picture isn't used.
+    let out = dir.join("v.mp4");
+    let mut req = ExportRequest::new(t.clone(), out.clone());
+    req.preset = "ultrafast".into();
+    export(&req);
+    let p = pcm(&out);
+    assert!(rms(&p, 8000.0, 0.5, 3.5) > 500.0, "a's sound");
+    let mut one = FfmpegCli::locate().open_timeline_frames(&preview(&t, s(2), true)).unwrap();
+    let f = one.next_frame().unwrap().unwrap();
+    let mid = ((60 * 160 + 80) * 3) as usize;
+    assert!(f.rgb[mid] > 200 && f.rgb[mid + 1] < 60, "red: {:?}", &f.rgb[mid..mid + 3]);
+
+    // Exported as sound only: one audio stream, no picture, and much
+    // smaller than the video.
+    for name in ["a.m4a", "a.mp3", "a.opus", "a.flac", "a.wav"] {
+        let snd = dir.join(name);
+        let mut t2 = t.clone();
+        t2.video[0].clips.clear();
+        let req = ExportRequest::new(t2, snd.clone());
+        assert!(req.format.is_audio());
+        export(&req);
+        let info = FfmpegCli::locate().probe(&snd).unwrap();
+        assert_eq!(info.count(StreamKind::Video), 0, "{name}");
+        assert_eq!(info.count(StreamKind::Audio), 1, "{name}");
+        assert_close(info.duration.unwrap(), s(4));
+        assert!(rms(&pcm(&snd), 8000.0, 0.5, 3.5) > 500.0, "{name}");
+        assert_no_tags(&snd);
+        let bytes = std::fs::read(&snd).unwrap();
+        assert!(!bytes.windows(4).any(|w| w == b"Lavf" || w == b"Lavc"), "{name} names its encoder");
+    }
+    let m4a = std::fs::metadata(dir.join("a.m4a")).unwrap().len();
+    let mp4 = std::fs::metadata(&out).unwrap().len();
+    assert!(m4a < mp4, "{m4a} vs {mp4}");
+}

@@ -25,7 +25,7 @@ goes through the `Engine` trait.
   - `FLICKER_THEME=classic|light|dark` (FerroOS's menu entry uses classic).
   - Signed release workflow (minisign), waiting for a real key.
 
-- **v0.7: The timeline** (this release)
+- **v0.7: The timeline**
   - A timeline panel under the player: V1 and V2 (and more) video tracks,
     A1, A2… audio tracks, with per-track mute and hide.
   - Drop videos, pictures and sound on a track; move, trim, split, delete
@@ -38,16 +38,26 @@ goes through the `Engine` trait.
   - Cut mode, Edit > Append and the Audio menu are gone: the timeline does
     all of that.
 
+- **v0.8: Text, picture and effects** (this release)
+  - Titles (Edit > Add Text, `Ctrl+T`) on their own clips, drawn with
+    ffmpeg `drawtext`: size, colour, place, dark box.
+  - Right-click a clip: speed (0.25×–4×), detach audio, flip and rotate,
+    opacity, crop, and motion effects (Ken Burns zoom, pan, pulse, bounce,
+    float, shake, wobble, spin) with entrances and exits (fade, slide,
+    zoom, spin). Same graph in the player and the export.
+  - Cut, copy, paste, duplicate.
+  - Trimming follows the pointer exactly: it's computed from where the edge
+    was grabbed and no longer snaps to the playhead that follows it.
+  - Sound-only export (M4A, MP3, Opus, FLAC, WAV); videos on audio tracks
+    are never decoded for their picture.
+
 ## Next
 
-1. **v0.8: Text.** Title cards (a picture clip made from text) and text
-   over the video on V2 (ffmpeg `drawtext`), with a few fonts and positions.
-   Clip thumbnails and audio waveforms on the timeline.
-2. **v0.9: Picture.** Crop, rotate (upright phone videos), speed
-   (0.5×–2×), brightness/contrast/saturation per clip; position and size for
-   clips on V2 (picture-in-picture). Ducking: music gets quieter while a
-   video talks.
-3. **v1.0: Packaging.** Windows installer with ffmpeg next to the exe, and
+1. **v0.9: Picture.** Clip thumbnails and audio waveforms on the timeline;
+   fonts for titles; brightness/contrast/saturation per clip; position and
+   size for clips on V2 (picture-in-picture). Ducking: music gets quieter
+   while a video talks.
+2. **v1.0: Packaging.** Windows installer with ffmpeg next to the exe, and
    sound on Windows (WASAPI); FerroOS bundle; Android build (ffmpeg as a
    native library behind `Engine`, Storage Access Framework file picker,
    AAudio). Faster scrubbing by decoding in-process with libav

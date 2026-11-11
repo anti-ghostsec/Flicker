@@ -18,6 +18,11 @@ pub const OUTPUT_FORMATS: &[(&str, &str)] = &[
     ("WebM video (VP9 + Opus)", "webm"),
     ("Matroska video", "mkv"),
     ("QuickTime video", "mov"),
+    ("Sound only: M4A (AAC)", "m4a"),
+    ("Sound only: MP3", "mp3"),
+    ("Sound only: Opus", "opus"),
+    ("Sound only: FLAC (lossless)", "flac"),
+    ("Sound only: WAV (uncompressed)", "wav"),
 ];
 
 pub fn has_ext(path: &Path, exts: &[&str]) -> bool {

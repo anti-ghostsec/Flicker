@@ -45,6 +45,10 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("S", "Split the selected clip (or every clip) at the playhead"),
     ("Del", "Delete the selected clip, leaving a gap"),
     ("Shift+Del", "Ripple delete: delete it and close the gap"),
+    ("Ctrl+X / Ctrl+C / Ctrl+V", "Cut / copy the selected clip, paste it at the playhead"),
+    ("Ctrl+D", "Duplicate the selected clip"),
+    ("Ctrl+T", "Add text at the playhead"),
+    ("Shift (while dragging)", "Move or trim without snapping"),
     ("Esc", "Unselect"),
     ("+ / -", "Zoom the timeline in / out"),
     ("Ctrl+wheel", "Zoom the timeline around the pointer"),
@@ -53,7 +57,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+N / Ctrl+O", "New / open project"),
     ("Ctrl+S / Ctrl+Shift+S", "Save project / save project as"),
     ("Ctrl+I", "Add files to the timeline"),
-    ("Ctrl+E", "Export video"),
+    ("Ctrl+E", "Export the video (or just its sound)"),
 ];
 
 /// How long to wait after a drop from the file manager for the pointer to
@@ -410,7 +414,11 @@ impl FlickerApp {
             return;
         }
         self.project.finish();
-        if let Some(to) = save_file(&self.project.suggested_path("mp4")) {
+        // Nothing to see: suggest a sound file.
+        let t = self.project.timeline();
+        let pictures = t.video.iter().any(|tr| !tr.hidden && !tr.clips.is_empty());
+        let ext = if pictures { "mp4" } else { "m4a" };
+        if let Some(to) = save_file(&self.project.suggested_path(ext)) {
             self.export_to(ctx, to);
         }
     }
@@ -502,13 +510,34 @@ impl FlickerApp {
         if pressed(cmd(Key::Q)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        let at = self.player.position();
+        if pressed(cmd(Key::D)) {
+            self.view.duplicate_selected(&mut self.project);
+        }
+        if pressed(cmd(Key::T)) {
+            self.view.add_text(&mut self.project, at);
+        }
+        // Ctrl+C / X / V arrive as clipboard events, not key presses.
+        let (copy, cut, paste) = ctx.input(|i| {
+            let has = |f: fn(&egui::Event) -> bool| i.events.iter().any(f);
+            (
+                has(|e| matches!(e, egui::Event::Copy)),
+                has(|e| matches!(e, egui::Event::Cut)),
+                has(|e| matches!(e, egui::Event::Paste(_))),
+            )
+        });
+        if copy || cut {
+            self.view.copy_selected(&mut self.project, cut);
+        }
+        if paste {
+            self.view.paste(&mut self.project, at);
+        }
         if pressed(cmd_shift(Key::Z)) || pressed(cmd(Key::Y)) {
             self.redo();
         }
         if pressed(cmd(Key::Z)) {
             self.undo();
         }
-        let at = self.player.position();
         if pressed(plain(Key::Space)) {
             self.project.finish();
             self.player.toggle_play();
@@ -583,7 +612,7 @@ impl FlickerApp {
                     self.menu_add();
                 }
                 ui.separator();
-                if item(ui, has_clips && !busy, "Export Video…", "Ctrl+E") {
+                if item(ui, has_clips && !busy, "Export…", "Ctrl+E") {
                     self.export(&ctx);
                 }
                 ui.separator();
@@ -615,6 +644,19 @@ impl FlickerApp {
                 ui.separator();
                 let sel = self.view.selected.is_some();
                 let at = self.player.position();
+                if item(ui, sel, "Cut", "Ctrl+X") {
+                    self.view.copy_selected(&mut self.project, true);
+                }
+                if item(ui, sel, "Copy", "Ctrl+C") {
+                    self.view.copy_selected(&mut self.project, false);
+                }
+                if item(ui, self.view.can_paste(), "Paste at Playhead", "Ctrl+V") {
+                    self.view.paste(&mut self.project, at);
+                }
+                if item(ui, sel, "Duplicate", "Ctrl+D") {
+                    self.view.duplicate_selected(&mut self.project);
+                }
+                ui.separator();
                 if item(ui, has_clips, "Split at Playhead", "S") {
                     self.view.split(&mut self.project, at);
                 }
@@ -625,6 +667,9 @@ impl FlickerApp {
                     self.view.delete_selected(&mut self.project, true);
                 }
                 ui.separator();
+                if item(ui, true, "Add Text…", "Ctrl+T") {
+                    self.view.add_text(&mut self.project, at);
+                }
                 if item(ui, true, "Add Video Track", "") {
                     self.project.edit("Add Video Track", |t| t.add_track(TrackKind::Video));
                 }
@@ -1017,11 +1062,13 @@ impl eframe::App for FlickerApp {
             self.project.finish();
         }
         self.sync_player();
+        self.view.after_sync(&mut self.player);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(face).inner_margin(4))
             .show(ui, |ui| self.video_area(ui));
 
+        self.view.windows(&ctx, theme, &mut self.project);
         self.dialogs(&ctx);
         if self.close_now {
             ctx.request_repaint();
@@ -1106,7 +1153,7 @@ fn sunken_label(ui: &mut egui::Ui, theme: Theme, text: RichText, width: f32) {
 }
 
 /// A modal dialog. In the Windows 95 theme it gets the navy title bar.
-fn window(ctx: &egui::Context, theme: Theme, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+pub(crate) fn window(ctx: &egui::Context, theme: Theme, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     let frame = egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::same(3));
     egui::Modal::new(egui::Id::unique("dialog")).frame(frame).show(ctx, |ui| {
         ui.set_min_width(320.0);
@@ -1321,5 +1368,23 @@ mod dev {
                 let _ = std::fs::write(&path, out);
             })));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_video_dropped_on_an_audio_track_goes_there_for_its_sound() {
+        let mut t = Timeline::default();
+        let talk = Clip::video("talk.mp4".into(), Duration::from_secs(3), true);
+        let c = place(&mut t, talk, Some((TrackRef::A1, Duration::from_secs(2))), Duration::ZERO).unwrap();
+        assert_eq!(c.track, TrackRef::A1);
+        assert_eq!(t.clip(c).unwrap().start, Duration::from_secs(2));
+        // One without sound can't be heard there: it goes on V1 instead.
+        let silent = Clip::video("silent.mp4".into(), Duration::from_secs(3), false);
+        let c = place(&mut t, silent, Some((TrackRef::A1, Duration::ZERO)), Duration::ZERO).unwrap();
+        assert_eq!(c.track, TrackRef::V1);
     }
 }

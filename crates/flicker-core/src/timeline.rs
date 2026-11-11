@@ -28,6 +28,8 @@ pub enum ClipKind {
     Image,
     /// A sound file (music, voice).
     Audio,
+    /// Words drawn over the picture (see [`TextStyle`]); no file.
+    Text,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -84,10 +86,303 @@ pub struct Clip {
     /// How this clip blends with the one before it where they overlap.
     #[serde(default)]
     pub transition: TransitionKind,
+    /// Playback speed: 2.0 plays twice as fast (and takes half as long on
+    /// the timeline). Videos and sound only.
+    #[serde(default = "one64", skip_serializing_if = "is_one64")]
+    pub speed: f64,
+    /// 1.0 = solid, 0.0 = invisible.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub opacity: f32,
+    /// Turned and mirrored.
+    #[serde(default, skip_serializing_if = "Transform::is_identity")]
+    pub transform: Transform,
+    /// Edges cut off the source picture.
+    #[serde(default, skip_serializing_if = "Crop::is_none")]
+    pub crop: Crop,
+    /// Motion: throughout the clip, as it comes in and as it goes.
+    #[serde(default, skip_serializing_if = "Effects::is_none")]
+    pub effects: Effects,
+    /// What a text clip says and how it looks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextStyle>,
 }
 
 fn one() -> f32 {
     1.0
+}
+
+fn one64() -> f64 {
+    1.0
+}
+
+fn is_one(v: &f32) -> bool {
+    *v == 1.0
+}
+
+fn is_one64(v: &f64) -> bool {
+    *v == 1.0
+}
+
+/// Slowest and fastest clip speeds.
+pub const MIN_SPEED: f64 = 0.25;
+pub const MAX_SPEED: f64 = 4.0;
+
+/// Quarter turns clockwise, then mirroring, as seen on screen. Kept in one
+/// form only: mirrored both ways is a half turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Transform {
+    /// 0, 90, 180 or 270 degrees clockwise.
+    #[serde(default)]
+    pub rotate: u16,
+    #[serde(default)]
+    pub flip_h: bool,
+    #[serde(default)]
+    pub flip_v: bool,
+}
+
+impl Transform {
+    pub fn is_identity(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn normalized(mut self) -> Self {
+        self.rotate %= 360;
+        self.rotate -= self.rotate % 90;
+        if self.flip_h && self.flip_v {
+            self.flip_h = false;
+            self.flip_v = false;
+            self.rotate = (self.rotate + 180) % 360;
+        }
+        self
+    }
+
+    /// Turn what's on screen a quarter turn clockwise.
+    pub fn rotated_cw(self) -> Self {
+        // A turn of a mirrored picture is the turned picture mirrored the
+        // other way.
+        Self { rotate: self.rotate + 90, flip_h: self.flip_v, flip_v: self.flip_h }.normalized()
+    }
+
+    pub fn rotated_ccw(self) -> Self {
+        self.rotated_cw().rotated_cw().rotated_cw()
+    }
+
+    pub fn rotated_180(self) -> Self {
+        self.rotated_cw().rotated_cw()
+    }
+
+    /// Mirror what's on screen left to right.
+    pub fn flipped_h(self) -> Self {
+        Self { flip_h: !self.flip_h, ..self }.normalized()
+    }
+
+    /// Mirror what's on screen top to bottom.
+    pub fn flipped_v(self) -> Self {
+        Self { flip_v: !self.flip_v, ..self }.normalized()
+    }
+
+    /// Width and height trade places.
+    pub fn swaps_sides(&self) -> bool {
+        self.rotate % 180 == 90
+    }
+}
+
+/// Fractions of the source picture cut off each edge (0.0 to 0.45 each).
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct Crop {
+    #[serde(default)]
+    pub left: f32,
+    #[serde(default)]
+    pub right: f32,
+    #[serde(default)]
+    pub top: f32,
+    #[serde(default)]
+    pub bottom: f32,
+}
+
+impl Crop {
+    pub const MAX: f32 = 0.45;
+
+    pub fn is_none(&self) -> bool {
+        self.clamped() == Self::default()
+    }
+
+    pub fn clamped(&self) -> Self {
+        let c = |v: f32| if v.is_finite() { v.clamp(0.0, Self::MAX) } else { 0.0 };
+        Self { left: c(self.left), right: c(self.right), top: c(self.top), bottom: c(self.bottom) }
+    }
+}
+
+/// Movement for the whole length of a clip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Motion {
+    /// Slowly closer (Ken Burns).
+    ZoomIn,
+    /// Slowly further away.
+    ZoomOut,
+    /// Slides slowly to the left (zoomed in a little, so no edge shows).
+    PanLeft,
+    PanRight,
+    /// Beats a little bigger and back, once a second.
+    Pulse,
+    /// Hops up and down.
+    Bounce,
+    /// Drifts gently up and down.
+    Float,
+    /// Shakes like a hand-held camera in a quake.
+    Shake,
+    /// Rocks from side to side.
+    Wobble,
+    /// Turns round, once every four seconds.
+    Spin,
+}
+
+impl Motion {
+    pub const ALL: [Motion; 10] = [
+        Motion::ZoomIn,
+        Motion::ZoomOut,
+        Motion::PanLeft,
+        Motion::PanRight,
+        Motion::Pulse,
+        Motion::Bounce,
+        Motion::Float,
+        Motion::Shake,
+        Motion::Wobble,
+        Motion::Spin,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Motion::ZoomIn => "Zoom In (Ken Burns)",
+            Motion::ZoomOut => "Zoom Out",
+            Motion::PanLeft => "Pan Left",
+            Motion::PanRight => "Pan Right",
+            Motion::Pulse => "Pulse",
+            Motion::Bounce => "Bounce",
+            Motion::Float => "Float",
+            Motion::Shake => "Shake",
+            Motion::Wobble => "Wobble",
+            Motion::Spin => "Spin",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// How a clip comes in or goes out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Anim {
+    /// From (or off to) that side of the frame.
+    Slide(Side),
+    /// Grows from nothing (or shrinks to nothing).
+    Zoom,
+    /// Grows while turning (or shrinks while turning).
+    Spin,
+}
+
+impl Anim {
+    pub const ALL: [Anim; 6] = [
+        Anim::Slide(Side::Left),
+        Anim::Slide(Side::Right),
+        Anim::Slide(Side::Top),
+        Anim::Slide(Side::Bottom),
+        Anim::Zoom,
+        Anim::Spin,
+    ];
+
+    /// "Slide from Left" / "Slide to Left"…
+    pub fn name(self, entering: bool) -> String {
+        let dir = if entering { "from" } else { "to" };
+        match self {
+            Anim::Slide(s) => format!("Slide {dir} {s:?}"),
+            Anim::Zoom if entering => "Zoom In (grow)".into(),
+            Anim::Zoom => "Zoom Out (shrink)".into(),
+            Anim::Spin if entering => "Spin In".into(),
+            Anim::Spin => "Spin Out".into(),
+        }
+    }
+}
+
+/// Default length of an entrance or exit.
+pub const ANIM_LEN: Duration = Duration::from_millis(600);
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Effects {
+    #[serde(default)]
+    pub motion: Option<Motion>,
+    #[serde(default)]
+    pub enter: Option<Anim>,
+    #[serde(default = "anim_len", with = "secs")]
+    pub enter_len: Duration,
+    #[serde(default)]
+    pub exit: Option<Anim>,
+    #[serde(default = "anim_len", with = "secs")]
+    pub exit_len: Duration,
+}
+
+fn anim_len() -> Duration {
+    ANIM_LEN
+}
+
+impl Default for Effects {
+    fn default() -> Self {
+        Self { motion: None, enter: None, enter_len: ANIM_LEN, exit: None, exit_len: ANIM_LEN }
+    }
+}
+
+impl Effects {
+    pub fn is_none(&self) -> bool {
+        self.motion.is_none() && self.enter.is_none() && self.exit.is_none()
+    }
+}
+
+/// Where text sits in the frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextPlace {
+    Top,
+    #[default]
+    Middle,
+    Bottom,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextStyle {
+    pub text: String,
+    /// Letter height as a share of the frame's height (0.02 to 0.3).
+    #[serde(default = "text_size")]
+    pub size: f32,
+    /// RGB.
+    #[serde(default = "white")]
+    pub color: [u8; 3],
+    #[serde(default)]
+    pub place: TextPlace,
+    /// A dark box behind the letters.
+    #[serde(default)]
+    pub boxed: bool,
+}
+
+fn text_size() -> f32 {
+    0.08
+}
+
+fn white() -> [u8; 3] {
+    [255, 255, 255]
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self { text: String::new(), size: text_size(), color: white(), place: TextPlace::default(), boxed: false }
+    }
 }
 
 impl Clip {
@@ -108,6 +403,12 @@ impl Clip {
             fade_in: Duration::ZERO,
             fade_out: Duration::ZERO,
             transition: TransitionKind::default(),
+            speed: 1.0,
+            opacity: 1.0,
+            transform: Transform::default(),
+            crop: Crop::default(),
+            effects: Effects::default(),
+            text: None,
         }
     }
 
@@ -119,9 +420,49 @@ impl Clip {
         Self { kind: ClipKind::Audio, ..Self::video(path, len, true) }
     }
 
+    /// Words on the picture, shown for [`DEFAULT_IMAGE_LEN`].
+    pub fn text(style: TextStyle) -> Self {
+        Self { kind: ClipKind::Text, text: Some(style), ..Self::image(PathBuf::new()) }
+    }
+
+    /// The clip's speed, kept sensible (always 1 for pictures and text).
+    pub fn speed(&self) -> f64 {
+        if self.is_still() || !self.speed.is_finite() {
+            1.0
+        } else {
+            self.speed.clamp(MIN_SPEED, MAX_SPEED)
+        }
+    }
+
+    /// How much of the source plays in `d` of the timeline.
+    pub fn source_span(&self, d: Duration) -> Duration {
+        match self.speed() {
+            1.0 => d,
+            s => Duration::from_secs_f64(d.as_secs_f64() * s),
+        }
+    }
+
+    /// How long `d` of the source takes on the timeline.
+    fn timeline_span(&self, d: Duration) -> Duration {
+        match self.speed() {
+            1.0 => d,
+            s => Duration::from_secs_f64(d.as_secs_f64() / s),
+        }
+    }
+
     /// How long the clip plays.
     pub fn len(&self) -> Duration {
-        self.out_point.saturating_sub(self.in_point)
+        self.timeline_span(self.out_point.saturating_sub(self.in_point))
+    }
+
+    /// The clip has a file behind it (text clips don't).
+    pub fn has_file(&self) -> bool {
+        self.kind != ClipKind::Text
+    }
+
+    /// It shows a picture (on a video track).
+    pub fn has_picture(&self) -> bool {
+        self.kind != ClipKind::Audio
     }
 
     pub fn is_empty(&self) -> bool {
@@ -133,6 +474,10 @@ impl Clip {
     }
 
     pub fn name(&self) -> String {
+        if let Some(t) = self.text.as_ref().filter(|_| self.kind == ClipKind::Text) {
+            let first = t.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("Text");
+            return format!("T  {}", first.trim());
+        }
         self.path.file_name().unwrap_or(self.path.as_os_str()).to_string_lossy().into_owned()
     }
 
@@ -141,9 +486,9 @@ impl Clip {
         self.has_audio && !self.muted && self.volume > 0.0
     }
 
-    /// Can be stretched to any length (pictures).
+    /// Can be stretched to any length (pictures and text).
     pub fn is_still(&self) -> bool {
-        self.kind == ClipKind::Image
+        matches!(self.kind, ClipKind::Image | ClipKind::Text)
     }
 
     fn clamp_fades(&mut self) {
@@ -181,7 +526,7 @@ impl Track {
     /// audio tracks.
     pub fn accepts(&self, clip: &Clip) -> bool {
         match self.kind {
-            TrackKind::Video => matches!(clip.kind, ClipKind::Video | ClipKind::Image),
+            TrackKind::Video => clip.has_picture(),
             TrackKind::Audio => clip.kind == ClipKind::Audio || (clip.kind == ClipKind::Video && clip.has_audio),
         }
     }
@@ -446,7 +791,7 @@ impl Timeline {
                     None => Duration::ZERO,
                 };
                 if !clip.is_still() {
-                    lower = lower.max(start.saturating_sub(clip.in_point));
+                    lower = lower.max(start.saturating_sub(clip.timeline_span(clip.in_point)));
                 }
                 let upper = end.saturating_sub(MIN_CLIP).max(lower);
                 let new = t.clamp(lower, upper);
@@ -454,9 +799,9 @@ impl Timeline {
                 if clip.is_still() {
                     clip.out_point = end - new;
                 } else if new < start {
-                    clip.in_point -= start - new;
+                    clip.in_point = clip.in_point.saturating_sub(clip.source_span(start - new));
                 } else {
-                    clip.in_point += new - start;
+                    clip.in_point += clip.source_span(new - start);
                 }
                 clip.start = new;
                 clip.clamp_fades();
@@ -467,12 +812,15 @@ impl Timeline {
                     None => Duration::MAX,
                 };
                 if let (false, Some(src)) = (clip.is_still(), clip.source_len) {
-                    upper = upper.min(start + src.saturating_sub(clip.in_point));
+                    upper = upper.min(start + clip.timeline_span(src.saturating_sub(clip.in_point)));
                 }
                 let lower = start + MIN_CLIP;
                 let new = t.clamp(lower, upper.max(lower));
                 let clip = &mut track.clips[c.index];
-                clip.out_point = clip.in_point + (new - start);
+                clip.out_point = clip.in_point + clip.source_span(new - start);
+                if let (false, Some(src)) = (clip.is_still(), clip.source_len) {
+                    clip.out_point = clip.out_point.min(src.max(clip.in_point));
+                }
                 clip.clamp_fades();
             }
         }
@@ -493,12 +841,15 @@ impl Timeline {
             left.out_point = offset;
             right.out_point = clip.len() - offset;
         } else {
-            left.out_point = clip.in_point + offset;
-            right.in_point = clip.in_point + offset;
+            left.out_point = clip.in_point + clip.source_span(offset);
+            right.in_point = left.out_point;
         }
         right.start = t;
         left.fade_out = Duration::ZERO;
         right.fade_in = Duration::ZERO;
+        // The first half keeps how it comes in, the second how it goes.
+        left.effects.exit = None;
+        right.effects.enter = None;
         right.transition = TransitionKind::default();
         left.clamp_fades();
         right.clamp_fades();
@@ -602,19 +953,87 @@ impl Timeline {
         let first =
             clips().filter(|c| c.width.is_some() && c.height.is_some()).min_by_key(|c| c.kind != ClipKind::Video);
         match first {
-            Some(c) => Canvas {
-                width: c.width.unwrap_or(1280),
-                height: c.height.unwrap_or(720),
+            Some(c) => {
+                let (w, h) = (c.width.unwrap_or(1280), c.height.unwrap_or(720));
+                let (w, h) = if c.transform.swaps_sides() { (h, w) } else { (w, h) };
+                Canvas {
+                width: w,
+                height: h,
                 fps: clips().find_map(|c| c.fps).unwrap_or(30.0),
             }
-            .normalized(),
+            .normalized()
+            }
             None => Canvas::default(),
         }
     }
 
     /// Every file the project uses.
     pub fn files(&self) -> impl Iterator<Item = &Path> {
-        self.tracks().flat_map(|(_, t)| t.clips.iter().map(|c| c.path.as_path())).chain(self.subtitle.as_deref())
+        self.tracks()
+            .flat_map(|(_, t)| t.clips.iter().filter(|c| c.has_file()).map(|c| c.path.as_path()))
+            .chain(self.subtitle.as_deref())
+    }
+
+    /// Change a clip's speed (videos and sound). Its start stays put; if
+    /// it gets longer, the clips after it on its track move along to make
+    /// room.
+    pub fn set_speed(&mut self, c: ClipRef, speed: f64) -> bool {
+        let Some(track) = self.track_mut(c.track) else { return false };
+        let Some(clip) = track.clips.get_mut(c.index) else { return false };
+        if clip.is_still() || !speed.is_finite() {
+            return false;
+        }
+        let old_end = clip.end();
+        clip.speed = speed.clamp(MIN_SPEED, MAX_SPEED);
+        if clip.len() < MIN_CLIP {
+            clip.out_point = clip.in_point + clip.source_span(MIN_CLIP);
+        }
+        clip.clamp_fades();
+        let new_end = clip.end();
+        if let Some(next) = track.clips.get(c.index + 1) {
+            let push = new_end.saturating_sub(next.start.max(old_end));
+            if !push.is_zero() {
+                for later in &mut track.clips[c.index + 1..] {
+                    later.start += push;
+                }
+            }
+        }
+        true
+    }
+
+    /// A copy of a clip straight after it (or as near as there's room).
+    pub fn duplicate(&mut self, c: ClipRef) -> Option<ClipRef> {
+        let mut copy = self.clip(c)?.clone();
+        copy.transition = TransitionKind::default();
+        let at = copy.end();
+        self.add_clip(c.track, copy, at)
+    }
+
+    /// Put a video's sound on an audio track of its own, under the video
+    /// (which is muted). Returns the new sound clip.
+    pub fn detach_audio(&mut self, c: ClipRef) -> Option<ClipRef> {
+        if c.track.kind != TrackKind::Video {
+            return None;
+        }
+        let clip = self.clip(c)?;
+        if clip.kind != ClipKind::Video || !clip.has_audio || clip.muted {
+            return None;
+        }
+        let mut sound = clip.clone();
+        sound.transform = Transform::default();
+        sound.crop = Crop::default();
+        sound.effects = Effects::default();
+        sound.opacity = 1.0;
+        sound.transition = TransitionKind::default();
+        let (from, to) = (sound.start, sound.end());
+        let free = (0..self.audio.len()).find(|&i| self.audio[i].is_free(from, to, None));
+        let r = match free {
+            Some(i) => TrackRef::audio(i),
+            None => self.add_track(TrackKind::Audio),
+        };
+        let placed = self.add_clip(r, sound, from)?;
+        self.clip_mut(c)?.muted = true;
+        Some(placed)
     }
 }
 
@@ -872,5 +1291,113 @@ mod tests {
         assert!(json.contains("\"start\":9.0"), "{json}");
         let back: Timeline = serde_json::from_str(&json).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn turning_and_mirroring_compose_as_on_screen() {
+        let t = Transform::default();
+        assert!(t.is_identity());
+        let r = t.rotated_cw();
+        assert_eq!((r.rotate, r.swaps_sides()), (90, true));
+        assert_eq!(r.rotated_ccw(), t);
+        assert_eq!(t.rotated_180().rotated_180(), t);
+        assert_eq!(t.rotated_cw().rotated_cw().rotated_cw().rotated_cw(), t);
+        // Mirrored both ways is a half turn, kept in one form.
+        assert_eq!(t.flipped_h().flipped_v(), Transform { rotate: 180, ..t });
+        assert_eq!(t.flipped_h().flipped_h(), t);
+        // Mirroring left-right, then turning, is turning then mirroring
+        // top-bottom.
+        assert_eq!(t.flipped_h().rotated_cw(), Transform { rotate: 90, flip_h: false, flip_v: true });
+        assert_eq!(t.rotated_cw().flipped_v(), t.flipped_h().rotated_cw());
+    }
+
+    #[test]
+    fn crop_is_kept_in_range() {
+        let c = Crop { left: -1.0, right: 0.9, top: f32::NAN, bottom: 0.1 }.clamped();
+        assert_eq!(c, Crop { left: 0.0, right: Crop::MAX, top: 0.0, bottom: 0.1 });
+        assert!(Crop::default().is_none() && Crop { left: -0.5, ..Crop::default() }.is_none());
+    }
+
+    #[test]
+    fn speed_changes_the_length_and_pushes_later_clips() {
+        let mut t = project();
+        // a (10s) at double speed: 5s, the picture stays where it is.
+        assert!(t.set_speed(v1(0), 2.0));
+        let a = t.clip(v1(0)).unwrap();
+        assert_eq!((a.len(), a.out_point), (s(5), s(10)));
+        assert_eq!(starts(&t, TrackRef::V1), vec![s(0), s(10), s(14)]);
+        // At half speed it's 20s long: the picture and c move along.
+        t.set_speed(v1(0), 0.5);
+        assert_eq!(t.clip(v1(0)).unwrap().len(), s(20));
+        assert_eq!(starts(&t, TrackRef::V1), vec![s(0), s(20), s(24)]);
+        // Never slower than a quarter; pictures have no speed.
+        t.set_speed(v1(0), 0.01);
+        assert_eq!(t.clip(v1(0)).unwrap().speed(), MIN_SPEED);
+        assert!(!t.set_speed(v1(1), 2.0));
+        // Trimming and splitting work in timeline time, the source follows.
+        let mut t = project();
+        t.set_speed(v1(0), 2.0);
+        t.trim(v1(0), Edge::End, s(4));
+        assert_eq!(t.clip(v1(0)).unwrap().out_point, s(8));
+        t.trim(v1(0), Edge::End, s(9));
+        assert_eq!(t.clip(v1(0)).unwrap().end(), s(5), "no more than the source has");
+        t.trim(v1(0), Edge::Start, s(1));
+        let a = t.clip(v1(0)).unwrap();
+        assert_eq!((a.start, a.in_point, a.len()), (s(1), s(2), s(4)));
+        let b = t.split(v1(0), s(3)).unwrap();
+        assert_eq!((t.clip(v1(0)).unwrap().out_point, t.clip(b).unwrap().in_point), (s(6), s(6)));
+        assert_eq!(t.clip(b).unwrap().len(), s(2));
+    }
+
+    #[test]
+    fn duplicate_and_detach_audio() {
+        let mut t = project();
+        let c = t.duplicate(v1(1)).unwrap();
+        // No room straight after the picture (c is there): after c instead.
+        assert_eq!((c.index, t.clip(c).unwrap().start), (3, s(20)));
+        assert_eq!(t.clip(c).unwrap().path, PathBuf::from("b.png"));
+        // a's sound goes under it on a track of its own (A1 has music).
+        t.clip_mut(v1(0)).unwrap().transform = Transform::default().rotated_cw();
+        let snd = t.detach_audio(v1(0)).unwrap();
+        assert_eq!(snd.track, TrackRef::audio(1));
+        let k = t.clip(snd).unwrap();
+        assert_eq!((k.start, k.len(), k.kind, k.transform.is_identity()), (s(0), s(10), ClipKind::Video, true));
+        assert!(t.clip(v1(0)).unwrap().muted);
+        assert!(t.detach_audio(v1(0)).is_none(), "already done");
+        assert!(t.detach_audio(v1(2)).is_none(), "c has no sound");
+    }
+
+    #[test]
+    fn text_clips_have_no_file() {
+        let mut t = project();
+        let style = TextStyle { text: "\n  Hello there\nsecond".into(), ..TextStyle::default() };
+        let c = t.append(TrackRef::V1, Clip::text(style)).unwrap();
+        let k = t.clip(c).unwrap();
+        assert_eq!((k.name(), k.len(), k.is_still()), ("T  Hello there".to_string(), DEFAULT_IMAGE_LEN, true));
+        assert!(t.files().all(|f| !f.as_os_str().is_empty()));
+        assert!(t.append(TrackRef::A1, Clip::text(TextStyle::default())).is_none(), "no text on audio tracks");
+        t.trim(c, Edge::End, s(30));
+        assert_eq!(t.clip(c).unwrap().len(), s(10));
+    }
+
+    #[test]
+    fn old_projects_open_with_the_new_settings_off() {
+        let old = r#"{"video":[{"kind":"video","clips":[{"path":"a.mp4","kind":"video","out_point":3.0}]}],"audio":[]}"#;
+        let t: Timeline = serde_json::from_str(old).unwrap();
+        let c = &t.video[0].clips[0];
+        assert_eq!((c.speed, c.opacity), (1.0, 1.0));
+        assert!(c.transform.is_identity() && c.crop.is_none() && c.effects.is_none() && c.text.is_none());
+        // And the new settings survive a round trip.
+        let mut t = project();
+        let k = t.clip_mut(v1(1)).unwrap();
+        k.transform = Transform::default().flipped_v();
+        k.effects = Effects { motion: Some(Motion::ZoomIn), enter: Some(Anim::Slide(Side::Left)), exit: Some(Anim::Spin), ..Effects::default() };
+        k.opacity = 0.5;
+        k.crop.left = 0.1;
+        t.set_speed(v1(0), 1.5);
+        t.append(TrackRef::V1, Clip::text(TextStyle { text: "Hi".into(), boxed: true, ..TextStyle::default() }));
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(serde_json::from_str::<Timeline>(&json).unwrap(), t);
+        assert!(json.contains(r#""enter":{"slide":"left"}"#), "{json}");
     }
 }

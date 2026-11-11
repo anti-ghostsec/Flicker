@@ -2,18 +2,26 @@
 
 A cross-platform video editor written in Rust: a **timeline** with video, picture and audio tracks, **transitions**, **sound in the preview**, **subtitles** and **private exports**. It's meant to stay light enough for an old laptop with 1 GB of RAM. It runs on Linux now; Windows and Android are planned.
 
-## Features (v0.7)
+## Features (v0.8)
 
 Flicker is one window: the player at the top, the timeline under it, and a menu bar. Every change shows in the player straight away: there's no render or "apply" step. Only exporting takes time.
 
 ### The timeline
 
 - **Tracks:** V1 for videos and pictures, V2 (and more, with **+ Video Track**) drawn over V1, and audio tracks A1, A2… (**+ Audio Track**) for music and voice on top of the videos' own sound. Each track has **M** (mute its sound) and video tracks **H** (hide their picture). Right-click a track to remove it once it's empty.
-- **Adding files:** drag videos, pictures and sound files from the file manager onto a track, at the spot where they should start. A video dropped on an audio track adds just its sound. **File > Add to Timeline…** (`Ctrl+I`) puts videos and pictures at the end of V1, and sound at the playhead on the first audio track with room (or a new one).
-- **Moving:** drag a clip along its track or to another track of the same kind. Clips never cover each other: dropped on another clip, a clip goes to the nearest free spot. Edges snap to the playhead and to other clips.
-- **Trimming:** drag a clip's left or right edge. The player shows the frame at the edge while you drag. A picture's length is just its right edge (or **Length** in the clip's properties).
+- **Adding files:** drag videos, pictures and sound files from the file manager onto a track, at the spot where they should start. A video dropped on an audio track adds just its sound: its picture is never decoded, and a sound-only export (below) has no video stream at all. **File > Add to Timeline…** (`Ctrl+I`) puts videos and pictures at the end of V1, and sound at the playhead on the first audio track with room (or a new one).
+- **Moving:** drag a clip along its track or to another track of the same kind. Clips never cover each other: dropped on another clip, a clip goes to the nearest free spot. Edges snap to the playhead and to other clips; hold `Shift` to place freely.
+- **Trimming:** drag a clip's left or right edge. The edge follows the pointer exactly from where you grabbed it, a label shows its time and the clip's length, and the player shows the frame at the edge. It snaps to other clips' edges and the playhead (`Shift` to turn snapping off). A picture's or a title's length is just its right edge (or **Length** in the clip's properties).
 - **Splitting:** `S` splits the selected clip at the playhead (or every clip under the playhead when none is selected). **Delete** (`Del`) leaves a gap; **Ripple Delete** (`Shift+Del`) closes it.
+- **Cut, copy, paste and duplicate** (`Ctrl+X` / `Ctrl+C` / `Ctrl+V` / `Ctrl+D`, also in **Edit** and the right-click menu): pasting puts the clip at the playhead on the selected clip's track (or its own).
 - **Clip properties** (in the strip above the tracks when a clip is selected, or right-click): volume from 0 to 200%, mute, fade in and fade out.
+- **Right-click a clip** for the rest, so the window stays uncluttered:
+  - **Speed** 0.25× to 4× (videos and sound; the sound keeps its pitch). A clip that gets longer pushes the clips after it along.
+  - **Detach Audio** puts a video's sound on an audio track of its own and mutes the video.
+  - **Flip / Rotate**: flip horizontally or vertically, rotate 90° either way or 180° (pictures and videos; an upright phone video turned on V1 makes the whole project upright).
+  - **Effects**: *Motion* for the whole clip (Zoom In / Ken Burns, Zoom Out, Pan Left / Right, Pulse, Bounce, Float, Shake, Wobble, Spin), an *Entrance* and an *Exit* (Fade, Slide from / to any side, Zoom, Spin), 0.3 s to 2 s. They work on videos, pictures and titles, in the player and in the export.
+  - **Opacity** and **Crop** (each edge up to 45%).
+- **Text:** **Edit > Add Text…** (`Ctrl+T`), or right-click a video track > **Add Text Here…**: a title with its own clip (on V2 or higher, so it's drawn over the video), with size, colour, top / middle / bottom and an optional dark box. Right-click it > **Edit Text…** to change it. Titles can have effects too.
 - **Transitions:** right-click the join between two clips that touch, or use **From previous** in the properties: *Cut*, *Cross-fade* or *Dip to black*, 0.5 s to 10 s. The second clip moves back to overlap the first by the transition's length (everything after it on that track moves with it). Cross-fades show as an X on the clip, dips as a V.
 - **Zoom and scroll:** `+` / `-`, **Fit**, or `Ctrl`+wheel around the pointer. The wheel scrolls along the timeline (or up and down when the tracks don't all fit); the scrollbar under the tracks works too. Click or drag the ruler to move the playhead.
 - **Undo / Redo** (`Ctrl+Z` / `Ctrl+Y`) for every change; a drag is one step.
@@ -33,7 +41,7 @@ Flicker is one window: the player at the top, the timeline under it, and a menu 
 
 ### Exporting
 
-- **File > Export Video…** (`Ctrl+E`) renders the timeline to MP4 (H.264 + AAC), WebM (VP9 + Opus), MKV or MOV, with progress and **Cancel** in the status bar. ffmpeg writes straight into the chosen file in one pass; nothing else is written anywhere (no staging copy, nothing in `/tmp`). If the export is cancelled or fails, the unfinished file is deleted and the status bar says so.
+- **File > Export…** (`Ctrl+E`) renders the timeline to MP4 (H.264 + AAC), WebM (VP9 + Opus), MKV or MOV, or just its sound to M4A, MP3, Opus, FLAC or WAV (no picture is rendered then; a timeline with no pictures suggests M4A), with progress and **Cancel** in the status bar. ffmpeg writes straight into the chosen file in one pass; nothing else is written anywhere (no staging copy, nothing in `/tmp`). If the export is cancelled or fails, the unfinished file is deleted and the status bar says so.
 
 ### Subtitles
 
@@ -120,7 +128,7 @@ crates/
 2. ~~Video preview player~~
 3. ~~Trim / cut~~, ~~joining clips and pictures~~, ~~volume, mute and fades~~
 4. ~~A multi-track timeline, music tracks, sound in the preview, projects~~
-5. Text and titles; picture adjustments (crop, rotate, speed)
+5. ~~Text and titles; picture adjustments (crop, rotate, flip, speed, opacity); motion effects~~
 6. Subtitle editor (edit timings and text in-app)
 7. Android build + packaging (cargo-apk / xbuild); Windows installer
 

@@ -88,6 +88,31 @@ impl Project {
         r
     }
 
+    /// Like [`Project::live`], but `f` always starts from the timeline as
+    /// it was when the gesture began. A drag computes where things go from
+    /// where they were when it was picked up, never from the last frame's
+    /// result, so rounding and clamping can't build up and the outcome
+    /// depends only on where the pointer is now.
+    pub fn gesture<R>(&mut self, label: &str, f: impl FnOnce(&mut Timeline) -> R) -> R {
+        if self.pending.as_ref().is_some_and(|(_, l)| l != label) {
+            self.finish();
+        }
+        let start = match &self.pending {
+            Some((t, _)) => t.clone(),
+            None => {
+                self.pending = Some((self.timeline.clone(), label.to_owned()));
+                self.timeline.clone()
+            }
+        };
+        let mut next = start;
+        let r = f(&mut next);
+        if next != self.timeline {
+            self.timeline = next;
+            self.version += 1;
+        }
+        r
+    }
+
     /// End the gesture in progress, recording it if it changed anything.
     pub fn finish(&mut self) {
         if let Some((before, label)) = self.pending.take() {
@@ -247,6 +272,30 @@ mod tests {
         assert_eq!(p.undo_label(), Some("Fade in"));
         p.undo();
         assert_eq!(p.undo_label(), Some("Volume"));
+    }
+
+    #[test]
+    fn a_gesture_always_starts_from_where_it_began() {
+        let mut p = project();
+        let v0 = p.version();
+        // Each step is computed from the timeline before the drag: going
+        // back to the start gives exactly the start.
+        p.gesture("Trim", |t| t.trim(A, Edge::End, s(4)));
+        assert_eq!(p.timeline().video[0].clips[0].len(), s(4));
+        p.gesture("Trim", |t| t.trim(A, Edge::End, s(7)));
+        assert_eq!(p.timeline().video[0].clips[0].len(), s(7));
+        let v1 = p.version();
+        p.gesture("Trim", |t| t.trim(A, Edge::End, s(7)));
+        assert_eq!(p.version(), v1, "the same place again changes nothing");
+        p.gesture("Trim", |t| t.trim(A, Edge::End, s(10)));
+        assert!(p.version() > v0);
+        p.finish();
+        assert_eq!(p.undo_label(), None, "back where it began: nothing to undo");
+        p.gesture("Trim", |t| t.trim(A, Edge::Start, s(1)));
+        p.finish();
+        assert_eq!(p.undo_label(), Some("Trim"));
+        p.undo();
+        assert_eq!(p.timeline().video[0].clips[0].start, Duration::ZERO);
     }
 
     #[test]

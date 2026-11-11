@@ -99,7 +99,7 @@ pub fn from_json(json: &[u8], project_dir: Option<&Path>) -> Result<Timeline> {
     let relocate = |p: &mut PathBuf| *p = crate::input::from_project(p, project_dir);
     for track in t.video.iter_mut().chain(t.audio.iter_mut()) {
         track.clips.sort_by_key(|c| c.start);
-        for c in &mut track.clips {
+        for c in track.clips.iter_mut().filter(|c| c.has_file()) {
             relocate(&mut c.path);
         }
     }

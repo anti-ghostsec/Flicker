@@ -217,7 +217,7 @@ pub(crate) fn escape_filter_path(path: &Path) -> String {
     escape_chars(&level1, &['\\', '\'', '[', ']', ',', ';'])
 }
 
-fn escape_chars(s: &str, special: &[char]) -> String {
+pub(crate) fn escape_chars(s: &str, special: &[char]) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         if special.contains(&c) {
