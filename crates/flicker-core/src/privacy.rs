@@ -252,7 +252,7 @@ pub fn clean_ass(data: &[u8]) -> Vec<u8> {
 }
 
 fn utf16(data: &[u8], unit: fn([u8; 2]) -> u16) -> Vec<u8> {
-    let units = data.chunks_exact(2).map(|c| unit([c[0], c[1]]));
+    let units = data.as_chunks::<2>().0.iter().map(|&c| unit(c));
     char::decode_utf16(units)
         .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect::<String>()
