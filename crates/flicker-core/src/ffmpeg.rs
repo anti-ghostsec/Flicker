@@ -198,10 +198,12 @@ impl Engine for FfmpegCli {
         req.validate()?;
         // One pass, straight into the chosen file, already private (see
         // `privacy::output_args`): nothing else is written anywhere. The
-        // subtitle file, for a track or burning in, is read where it is.
+        // subtitle file, for a track or burning in, is read where it is,
+        // except an ASS/SSA track, which comes cleaned through stdin.
+        let stdin = render::export_stdin(req)?;
         let before = file_stamp(&req.output);
         let args = render::export_args(req);
-        let result = self.run(&args, Some(req.timeline.duration()), on_progress, cancel);
+        let result = self.run_fed(&args, stdin, Some(req.timeline.duration()), on_progress, cancel);
         if result.is_err() && file_stamp(&req.output) != before {
             // Half-written: remove it. (A file of that name that ffmpeg
             // never got to is left alone.)
@@ -565,13 +567,35 @@ impl FfmpegCli {
         on_progress: &mut dyn FnMut(Progress),
         cancel: &CancelToken,
     ) -> Result<()> {
+        self.run_fed(args, None, total, on_progress, cancel)
+    }
+
+    /// [`Self::run`], with `stdin` (if any) written to ffmpeg's stdin.
+    fn run_fed(
+        &self,
+        args: &[std::ffi::OsString],
+        stdin: Option<Vec<u8>>,
+        total: Option<Duration>,
+        on_progress: &mut dyn FnMut(Progress),
+        cancel: &CancelToken,
+    ) -> Result<()> {
         let mut child = command(&self.ffmpeg)
             .args(args)
-            .stdin(Stdio::null())
+            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| spawn_error(&self.ffmpeg, e))?;
+
+        // On its own thread, as ffmpeg may read it only bit by bit. Closing
+        // it ends the input; a write error means ffmpeg has stopped, which
+        // its exit status tells.
+        let feeder = stdin.zip(child.stdin.take()).map(|(data, mut pipe)| {
+            thread::spawn(move || {
+                use std::io::Write;
+                let _ = pipe.write_all(&data);
+            })
+        });
 
         // Drain stderr on its own thread so ffmpeg never blocks on a full pipe.
         let stderr = child.stderr.take().expect("stderr piped");
@@ -582,6 +606,9 @@ impl FfmpegCli {
 
         let status = child.wait()?;
         let log = log.join().unwrap_or_default();
+        if let Some(f) = feeder {
+            let _ = f.join();
+        }
 
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);

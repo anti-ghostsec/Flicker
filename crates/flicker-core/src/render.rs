@@ -652,7 +652,13 @@ pub fn export_args(req: &ExportRequest) -> Vec<OsString> {
     a.extend(inputs);
     let soft = subtitle.filter(|_| t.subtitle_export == SubtitleExport::Track);
     if let Some(sub) = soft {
-        a.extend(crate::input::args(sub));
+        if crate::privacy::is_ass(sub) {
+            // Read from stdin, without its author and file paths: see
+            // `export_stdin`.
+            a.extend(strs(&["-protocol_whitelist", "pipe", "-f", "ass", "-i", "pipe:0"]));
+        } else {
+            a.extend(crate::input::args(sub));
+        }
     }
     a.push("-filter_complex".into());
     a.push(graph.into());
@@ -693,6 +699,19 @@ pub fn export_args(req: &ExportRequest) -> Vec<OsString> {
     }
     a.push(req.output.clone().into());
     a
+}
+
+/// What an export feeds ffmpeg on stdin: an ASS/SSA subtitle track is
+/// handed over through [`crate::privacy::clean_ass`], since the track keeps
+/// its file's header, and that names who wrote it and where their files are.
+pub fn export_stdin(req: &ExportRequest) -> Result<Option<Vec<u8>>> {
+    let t = &req.timeline;
+    match (&t.subtitle, t.subtitle_export) {
+        (Some(sub), SubtitleExport::Track) if !req.format.is_audio() && crate::privacy::is_ass(sub) => {
+            Ok(Some(crate::privacy::clean_ass(&std::fs::read(sub)?)))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// An export of the sound alone: no picture is decoded or written, and
@@ -928,9 +947,19 @@ mod tests {
         assert!(a.contains("-map 4:s:0 -c:s mov_text -metadata:s:s:0 language=eng"), "{a}");
         assert!(a.contains("filter_units=remove_types=6"), "{a}");
         t.subtitle_export = SubtitleExport::Burn;
-        let req = ExportRequest::new(t, "out.mp4".into());
+        let req = ExportRequest::new(t.clone(), "out.mp4".into());
         let a = join(&export_args(&req));
         assert!(a.contains(r"subtitles=filename=file\\:s.srt[vout]") && !a.contains("-i file:s.srt"), "{a}");
+        assert!(export_stdin(&req).unwrap().is_none());
+
+        // An ASS track comes through stdin (cleaned, see `export_stdin`),
+        // and only from there.
+        t.subtitle = Some("s.ass".into());
+        t.subtitle_export = SubtitleExport::Track;
+        let a = join(&export_args(&ExportRequest::new(t, "out.mkv".into())));
+        assert!(a.contains("-protocol_whitelist pipe -f ass -i pipe:0 -filter_complex"), "{a}");
+        assert!(a.contains("-map 4:s:0 -c:s ass"), "{a}");
+        assert!(!a.contains("s.ass"), "{a}");
     }
 
     /// Whatever a clip or subtitle file is called, ffmpeg gets it as a
